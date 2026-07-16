@@ -685,6 +685,11 @@ func artworkBytes(plan []Planned, root string) (int64, error) {
 
 func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string]bool) error {
 	started := time.Now()
+	type artworkCopy struct {
+		source      string
+		destination string
+		modTime     time.Time
+	}
 	plannedDirs := map[string]string{}
 	sources := map[string]string{}
 	for _, item := range plan {
@@ -700,7 +705,8 @@ func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string
 		}
 	}
 	available := 0
-	written := 0
+	var copies []artworkCopy
+	var emptyArtworkDirs []string
 	for destinationDir, relativeDir := range plannedDirs {
 		if !artworkDirs[relativeDir] {
 			continue
@@ -708,12 +714,7 @@ func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string
 		destination := filepath.Join(destinationDir, "AlbumArt.jpg")
 		source := sources[destinationDir]
 		if source == "" {
-			if dry {
-				continue
-			}
-			if err := os.MkdirAll(destinationDir, 0755); err != nil {
-				return err
-			}
+			emptyArtworkDirs = append(emptyArtworkDirs, destinationDir)
 			continue
 		}
 		sourceInfo, err := os.Stat(source)
@@ -721,21 +722,45 @@ func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string
 			continue
 		}
 		available++
+		if sameFile(source, destination) {
+			continue
+		}
+		copies = append(copies, artworkCopy{source, destination, sourceInfo.ModTime()})
+	}
+	sort.Slice(copies, func(i, j int) bool { return copies[i].destination < copies[j].destination })
+	for _, destinationDir := range emptyArtworkDirs {
 		if dry {
 			continue
 		}
 		if err := os.MkdirAll(destinationDir, 0755); err != nil {
 			return err
 		}
-		if sameFile(source, destination) {
-			continue
-		}
-		written++
-		if err := copyFile(source, destination, sourceInfo.ModTime()); err != nil {
-			return err
-		}
 	}
-	fmt.Printf("ジャケ写: %d件取得 / %d件配置（処理時間: %s）\n", available, written, time.Since(started).Round(time.Millisecond))
+	if len(copies) > 0 && !dry {
+		lastDraw := time.Time{}
+		drawProgress := func(done int) {
+			percent := float64(done) * 100 / float64(len(copies))
+			fmt.Printf("\033[2K\rジャケ写を配置中 [%d/%d] %5.1f%%", done, len(copies), percent)
+			lastDraw = time.Now()
+		}
+		drawProgress(0)
+		for index, copy := range copies {
+			if err := os.MkdirAll(filepath.Dir(copy.destination), 0755); err != nil {
+				fmt.Print("\033[2K\r")
+				return err
+			}
+			if err := copyFile(copy.source, copy.destination, copy.modTime); err != nil {
+				fmt.Print("\033[2K\r")
+				return err
+			}
+			done := index + 1
+			if done == len(copies) || done%10 == 0 || time.Since(lastDraw) >= time.Second {
+				drawProgress(done)
+			}
+		}
+		fmt.Print("\033[2K\r\n")
+	}
+	fmt.Printf("ジャケ写: %d件取得 / %d件配置（処理時間: %s）\n", available, len(copies), time.Since(started).Round(time.Millisecond))
 	return nil
 }
 
