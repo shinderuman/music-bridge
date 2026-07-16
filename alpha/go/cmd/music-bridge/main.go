@@ -10,28 +10,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"unicode/utf8"
 )
 
 const dataDir = "music-bridge"
+const libraryDir = "Library"
 const marker = ".music-bridge-target"
 const manifest = ".music-bridge-manifest.json"
-
-type Track struct {
-	Name        string `json:"name"`
-	Artist      string `json:"artist"`
-	AlbumArtist string `json:"album_artist"`
-	Album       string `json:"album"`
-	Location    string `json:"location"`
-}
-
-type Playlist struct {
-	Name       string  `json:"name"`
-	TrackCount int     `json:"trackCount,omitempty"`
-	Tracks     []Track `json:"tracks,omitempty"`
-}
+const completionSound = "/System/Library/Sounds/Glass.aiff"
 
 type Planned struct {
 	Track    Track
@@ -42,6 +30,7 @@ type Planned struct {
 func main() {
 	if len(os.Args) < 2 {
 		usage()
+		notifyCompletion()
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -55,302 +44,25 @@ func main() {
 		}
 	default:
 		usage()
+		notifyCompletion()
 		os.Exit(2)
 	}
+	notifyCompletion()
 }
 
 func usage() {
-	fmt.Println("usage: music-bridge {playlists|sync} [--target PATH] [--init-target] [--dry-run] [--yes]")
+	fmt.Println("usage: music-bridge {playlists|sync} [--target PATH] [--init-target] [--dry-run] [--refresh]")
 }
-func fatal(err error) { fmt.Fprintln(os.Stderr, "music-bridge:", err); os.Exit(1) }
-
-func sourceArgs(source string, summary bool, names []string) ([]string, error) {
-	if source == "" {
-		source = "scripts/export_music_library.js"
-	}
-	args := []string{"-l", "JavaScript", source}
-	if summary {
-		args = append(args, "--summary")
-	}
-	for _, name := range names {
-		args = append(args, "--playlist", name)
-	}
-	return args, nil
+func fatal(err error) {
+	fmt.Fprintln(os.Stderr, "music-bridge:", err)
+	notifyCompletion()
+	os.Exit(1)
 }
 
-func loadPlaylists(source string, summary bool, names []string) ([]Playlist, error) {
-	if source != "" {
-		data, err := os.ReadFile(source)
-		if err != nil {
-			return nil, err
-		}
-		var playlists []Playlist
-		if err := json.Unmarshal(data, &playlists); err != nil {
-			return nil, err
-		}
-		return filterPlaylists(playlists, names), nil
-	}
-	args, _ := sourceArgs(source, summary, names)
-	cmd := exec.Command("osascript", args...)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("Music.appから取得できませんでした: %w", err)
-	}
-	var playlists []Playlist
-	if err := json.Unmarshal(out, &playlists); err != nil {
-		return nil, fmt.Errorf("取得結果がJSONではありません: %w", err)
-	}
-	return playlists, nil
-}
-
-func filterPlaylists(all []Playlist, names []string) []Playlist {
-	if len(names) == 0 {
-		return all
-	}
-	want := map[string]bool{}
-	for _, name := range names {
-		want[name] = true
-	}
-	var result []Playlist
-	for _, p := range all {
-		if want[p.Name] {
-			result = append(result, p)
-		}
-	}
-	return result
-}
-
-func runPlaylists(argv []string) error {
-	fs := flag.NewFlagSet("playlists", flag.ContinueOnError)
-	source := fs.String("source-json", "", "JSON source")
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-	playlists, err := loadPlaylists(*source, true, nil)
-	if err != nil {
-		return err
-	}
-	for _, p := range playlists {
-		count := p.TrackCount
-		if count == 0 {
-			count = len(p.Tracks)
-		}
-		fmt.Printf("%s\t%d曲\n", p.Name, count)
-	}
-	return nil
-}
-
-func chooseMany(playlists []Playlist, root string) ([]Playlist, error) {
-	if len(playlists) == 0 {
-		return nil, fmt.Errorf("プレイリストがありません")
-	}
-	selected := map[int]bool{}
-	seenNames := map[string]bool{}
-	duplicates := map[string]bool{}
-	for _, p := range playlists {
-		name := safeName(p.Name)
-		if seenNames[name] {
-			duplicates[name] = true
-		}
-		seenNames[name] = true
-	}
-	for i, p := range playlists {
-		path := filepath.Join(root, safeName(p.Name)+".m3u")
-		if _, err := os.Stat(path); err == nil {
-			selected[i] = true
-		}
-	}
-	returnItems := func() []Playlist {
-		result := []Playlist{}
-		for i, p := range playlists {
-			if selected[i] {
-				result = append(result, p)
-			}
-		}
-		return result
-	}
-	warning := ""
-	if len(duplicates) > 0 {
-		warning = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n" +
-			"! 警告: 同名プレイリストが存在します                 !\r\n" +
-			"! このアプリは同名プレイリストに対応していません。   !\r\n" +
-			"! 名前で区別できないため、正しく同期できません。     !\r\n" +
-			"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-	}
-	return interactiveMany(playlists, selected, warning, func(i int) string {
-		p := playlists[i]
-		count := p.TrackCount
-		if count == 0 {
-			count = len(p.Tracks)
-		}
-		return fmt.Sprintf("%s (%d曲)", p.Name, count)
-	}, returnItems)
-}
-
-func chooseTarget(explicit string) (string, error) {
-	if explicit != "" {
-		return explicit, nil
-	}
-	entries, err := os.ReadDir("/Volumes")
-	if err != nil {
-		return "", err
-	}
-	var volumes []string
-	for _, e := range entries {
-		if e.IsDir() {
-			volumes = append(volumes, filepath.Join("/Volumes", e.Name()))
-		}
-	}
-	sort.Strings(volumes)
-	if len(volumes) == 0 {
-		return "", fmt.Errorf("/Volumesに同期先がありません")
-	}
-	index, err := interactiveOne(volumes, "同期先を選択してください", func(i int) string { return volumes[i] })
-	if err != nil {
-		return "", err
-	}
-	return volumes[index], nil
-}
-
-func terminalRaw() (func(), error) {
-	getState := exec.Command("stty", "-g")
-	getState.Stdin = os.Stdin
-	state, err := getState.Output()
-	if err != nil {
-		return nil, err
-	}
-	setRaw := exec.Command("stty", "raw", "-echo")
-	setRaw.Stdin = os.Stdin
-	if err := setRaw.Run(); err != nil {
-		return nil, err
-	}
-	return func() {
-		restore := exec.Command("stty", strings.TrimSpace(string(state)))
-		restore.Stdin = os.Stdin
-		_ = restore.Run()
-	}, nil
-}
-
-func key() (string, error) {
-	b := make([]byte, 1)
-	if _, err := os.Stdin.Read(b); err != nil {
-		return "", err
-	}
-	if b[0] == 27 {
-		rest := make([]byte, 2)
-		if _, err := io.ReadFull(os.Stdin, rest); err != nil {
-			return "", err
-		}
-		return string(append(b, rest...)), nil
-	}
-	size := 1
-	switch {
-	case b[0]&0xE0 == 0xC0:
-		size = 2
-	case b[0]&0xF0 == 0xE0:
-		size = 3
-	case b[0]&0xF8 == 0xF0:
-		size = 4
-	}
-	if size == 1 || !utf8.FullRune(append([]byte(nil), b...)) {
-		// ASCIIキーはそのまま返す。マルチバイト文字は下で残りを読む。
-		if b[0] < 0x80 {
-			return string(b), nil
-		}
-	}
-	if size == 1 {
-		return string(b), nil
-	}
-	rest := make([]byte, size-1)
-	if _, err := io.ReadFull(os.Stdin, rest); err != nil {
-		return "", err
-	}
-	return string(append(b, rest...)), nil
-}
-
-func interactiveOne(items []string, title string, label func(int) string) (int, error) {
-	restore, err := terminalRaw()
-	if err != nil {
-		return 0, err
-	}
-	defer restore()
-	index := 0
-	for {
-		fmt.Print("\033[2J\033[H", title, "\r\n")
-		for i := range items {
-			cursor := " "
-			if i == index {
-				cursor = "▶"
-			}
-			fmt.Printf("%s %s\r\n", cursor, label(i))
-		}
-		fmt.Print("\r\n↑↓:移動  Enter:決定  q:中止\r\n")
-		k, err := key()
-		if err != nil {
-			return 0, err
-		}
-		switch k {
-		case "\033[A", "k":
-			index = (index - 1 + len(items)) % len(items)
-		case "\033[B", "j":
-			index = (index + 1) % len(items)
-		case "\r", "\n":
-			return index, nil
-		case "q":
-			return 0, fmt.Errorf("ユーザーにより中断しました")
-		}
-	}
-}
-
-func interactiveMany(items []Playlist, selected map[int]bool, warning string, label func(int) string, result func() []Playlist) ([]Playlist, error) {
-	restore, err := terminalRaw()
-	if err != nil {
-		return nil, err
-	}
-	defer restore()
-	index := 0
-	for {
-		fmt.Print("\033[2J\033[Hプレイリストを選択してください\r\n")
-		if warning != "" {
-			fmt.Print("\r\n", warning, "\r\n")
-		}
-		for i := range items {
-			cursor := " "
-			if i == index {
-				cursor = "▶"
-			}
-			mark := "[ ]"
-			if selected[i] {
-				mark = "[x]"
-			}
-			fmt.Printf("%s %s %s\r\n", cursor, mark, label(i))
-		}
-		fmt.Print("\r\n↑↓:移動  Space:選択  a:全選択  Enter:決定  q:中止\r\n")
-		k, err := key()
-		if err != nil {
-			return nil, err
-		}
-		switch k {
-		case "\033[A", "k":
-			index = (index - 1 + len(items)) % len(items)
-		case "\033[B", "j":
-			index = (index + 1) % len(items)
-		case " ", "　":
-			selected[index] = !selected[index]
-		case "a":
-			for i := range items {
-				selected[i] = true
-			}
-		case "\r", "\n":
-			if len(result()) == 0 {
-				return nil, fmt.Errorf("プレイリストが選択されていません")
-			}
-			return result(), nil
-		case "q":
-			return nil, fmt.Errorf("ユーザーにより中断しました")
-		}
-	}
+func notifyCompletion() {
+	// Terminal.appはBELでDockバッジ・Dockアイコンのバウンスを表示できる。
+	fmt.Fprint(os.Stderr, "\a")
+	_ = exec.Command("afplay", completionSound).Run()
 }
 
 func runSync(argv []string) error {
@@ -358,6 +70,7 @@ func runSync(argv []string) error {
 	target := fs.String("target", "", "target volume")
 	initTarget := fs.Bool("init-target", false, "initialize target")
 	dryRun := fs.Bool("dry-run", false, "dry run")
+	refresh := fs.Bool("refresh", false, "refresh playlist cache from Music.app")
 	source := fs.String("source-json", "", "JSON source")
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -381,6 +94,11 @@ func runSync(argv []string) error {
 			return err
 		}
 	}
+	if !*dryRun {
+		if err := migrateLegacyLayout(root); err != nil {
+			return err
+		}
+	}
 	summaries, err := loadPlaylists(*source, true, nil)
 	if err != nil {
 		return err
@@ -389,12 +107,12 @@ func runSync(argv []string) error {
 	if err != nil {
 		return err
 	}
-	names := make([]string, len(selected))
-	for i, p := range selected {
-		names[i] = p.Name
+	artworkDir, err := os.MkdirTemp("", "music-bridge-artwork-")
+	if err != nil {
+		return err
 	}
-	fmt.Println("選択したプレイリストの曲情報を取得中...")
-	playlists, err := loadPlaylists(*source, false, names)
+	defer os.RemoveAll(artworkDir)
+	playlists, err := loadSyncPlaylists(*source, selected, *refresh)
 	if err != nil {
 		return err
 	}
@@ -402,26 +120,64 @@ func runSync(argv []string) error {
 	if err != nil {
 		return err
 	}
+	artworkDirs := map[string]bool{}
+	if !*dryRun {
+		// 容量不足の場合、今回の同期対象にならない曲のジャケ写を取得しても
+		// 配置されず、次回も同じ問い合わせを繰り返す。まず音源だけで収まる
+		// 範囲を仮決定し、その範囲のアルバムだけをMusic.appへ問い合わせる。
+		artworkPlan := plan
+		audioWithoutArtwork, err := existingBytes(plan, root)
+		if err != nil {
+			return err
+		}
+		freeBeforeArtwork, err := freeBytes(volume)
+		if err != nil {
+			return err
+		}
+		if audioWithoutArtwork > freeBeforeArtwork {
+			artworkPlan = fitPlan(plan, root, freeBeforeArtwork)
+		}
+		artworkDirs = artworkCandidateDirs(artworkPlan, root)
+		if err := exportArtworks(playlists, artworkDir, artworkRequests(playlists, artworkPlan, artworkDirs)); err != nil {
+			return err
+		}
+		// exportArtworks は playlists 内の Track.Artwork を更新する。転送計画は
+		// Track の値を保持しているため、画像の配置・容量計算へ反映させるには
+		// ここで作り直す必要がある。
+		plan, missing, err = makePlan(playlists)
+		if err != nil {
+			return err
+		}
+	}
 	if len(missing) > 0 {
 		fmt.Printf("ローカルファイルなし: %d曲\n", len(missing))
 	}
 	cleanupPlan := append([]Planned(nil), plan...)
-	required, err := existingBytes(plan, root)
+	audioRequired, err := existingBytes(plan, root)
 	if err != nil {
 		return err
 	}
+	artworkRequired, err := artworkBytes(plan, root)
+	if err != nil {
+		return err
+	}
+	required := audioRequired + artworkRequired
 	free, err := freeBytes(volume)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("選択プレイリスト: %d件 / 曲: %d曲\n", len(playlists), countTracks(playlists))
-	fmt.Printf("新規転送容量: %s / 空き容量: %s\n", humanBytes(required), humanBytes(free))
+	fmt.Printf("新規転送容量: 音源 %s + ジャケ写 %s = %s / 空き容量: %s\n", humanBytes(audioRequired), humanBytes(artworkRequired), humanBytes(required), humanBytes(free))
 	if required > free {
 		fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		fmt.Println("!!! 警告: 容量が不足しています。                  !!!")
 		fmt.Printf("!!! 必要容量: %s / 空き容量: %s / 不足: %s !!!\n", humanBytes(required), humanBytes(free), humanBytes(required-free))
 		fmt.Println("!!! 空き容量に収まる範囲で同期を続行します。      !!!")
-		plan = fitPlan(plan, root, free)
+		artworkBudget := free - artworkRequired
+		if artworkBudget < 0 {
+			artworkBudget = 0
+		}
+		plan = fitPlan(plan, root, artworkBudget)
 	}
 	stale := stalePlaylists(summaries, selected, root)
 	if len(stale) > 0 {
@@ -439,10 +195,13 @@ func runSync(argv []string) error {
 			}
 		}
 	}
-	if err := transfer(plan, root, *dryRun, labels); err != nil {
+	if err := writePlaylists(playlists, plan, root, *dryRun); err != nil {
 		return err
 	}
-	if err := writePlaylists(playlists, plan, root, *dryRun); err != nil {
+	if err := writeArtworks(plan, root, *dryRun, artworkDirs); err != nil {
+		return err
+	}
+	if err := transfer(plan, root, *dryRun, labels); err != nil {
 		return err
 	}
 	if !*dryRun {
@@ -506,7 +265,7 @@ func makePlan(playlists []Playlist) ([]Planned, []string, error) {
 			if artist == "" {
 				artist = t.Artist
 			}
-			rel := filepath.Join(artist, t.Album, filepath.Base(t.Location))
+			rel := filepath.Join(libraryDir, artist, t.Album, filepath.Base(t.Location))
 			plan = append(plan, Planned{t, rel, info.Size()})
 		}
 	}
@@ -531,6 +290,14 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
+func truncateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
+}
+
 func freeBytes(path string) (int64, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
@@ -540,43 +307,21 @@ func freeBytes(path string) (int64, error) {
 }
 
 func sameFile(source, destination string) bool {
-	a, err := os.Open(source)
+	ai, err := os.Stat(source)
 	if err != nil {
 		return false
 	}
-	defer a.Close()
-	b, err := os.Open(destination)
+	bi, err := os.Stat(destination)
 	if err != nil {
 		return false
 	}
-	defer b.Close()
-	ai, err := a.Stat()
-	if err != nil {
-		return false
+	modTimeDelta := ai.ModTime().Sub(bi.ModTime())
+	if modTimeDelta < 0 {
+		modTimeDelta = -modTimeDelta
 	}
-	bi, err := b.Stat()
-	if err != nil || ai.Size() != bi.Size() {
-		return false
-	}
-	bufA, bufB := make([]byte, 1024*1024), make([]byte, 1024*1024)
-	for {
-		na, ea := a.Read(bufA)
-		nb, eb := b.Read(bufB)
-		if na != nb {
-			return false
-		}
-		for i := 0; i < na; i++ {
-			if bufA[i] != bufB[i] {
-				return false
-			}
-		}
-		if ea == io.EOF && eb == io.EOF {
-			return true
-		}
-		if ea != nil || eb != nil {
-			return false
-		}
-	}
+	// exFATでは更新日時の精度が低く、macOS側と数ms〜数十msずれる。
+	return ai.Mode().IsRegular() && bi.Mode().IsRegular() &&
+		ai.Size() == bi.Size() && modTimeDelta <= 2*time.Second
 }
 
 func existingBytes(plan []Planned, root string) (int64, error) {
@@ -629,11 +374,101 @@ func saveManifest(root string, plan []Planned) error {
 		paths = append(paths, item.Relative)
 	}
 	sort.Strings(paths)
+	return saveManifestPaths(root, paths)
+}
+
+func saveManifestPaths(root string, paths []string) error {
 	data, err := json.MarshalIndent(paths, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(root, manifest), append(data, '\n'), 0644)
+}
+
+func migrateLegacyLayout(root string) error {
+	libraryRoot := filepath.Join(root, libraryDir)
+	if info, err := os.Stat(libraryRoot); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("ライブラリディレクトリがディレクトリではありません: %s", libraryRoot)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	var legacyDirs []string
+	type playlistFile struct {
+		path string
+		data []byte
+	}
+	var playlists []playlistFile
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			legacyDirs = append(legacyDirs, entry.Name())
+			continue
+		}
+		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".m3u" {
+			path := filepath.Join(root, entry.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			playlists = append(playlists, playlistFile{path, prefixLibraryInM3U(data)})
+		}
+	}
+	if len(legacyDirs) == 0 {
+		return nil
+	}
+
+	manifestPaths := loadManifest(root)
+	for i, path := range manifestPaths {
+		if !strings.HasPrefix(filepath.ToSlash(path), libraryDir+"/") {
+			manifestPaths[i] = filepath.Join(libraryDir, path)
+		}
+	}
+
+	fmt.Printf("既存ライブラリを %s/ へ移行中...\n", libraryDir)
+	if err := os.Mkdir(libraryRoot, 0755); err != nil {
+		return err
+	}
+	for _, name := range legacyDirs {
+		if err := os.Rename(filepath.Join(root, name), filepath.Join(libraryRoot, name)); err != nil {
+			return err
+		}
+	}
+	for _, playlist := range playlists {
+		if err := os.WriteFile(playlist.path, playlist.data, 0644); err != nil {
+			return err
+		}
+	}
+	if len(manifestPaths) > 0 {
+		sort.Strings(manifestPaths)
+		if err := saveManifestPaths(root, manifestPaths); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("ライブラリ移行完了: %dディレクトリ\n", len(legacyDirs))
+	return nil
+}
+
+func prefixLibraryInM3U(data []byte) []byte {
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		ending := ""
+		if strings.HasSuffix(line, "\r") {
+			line = strings.TrimSuffix(line, "\r")
+			ending = "\r"
+		}
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "\ufeff#") || strings.HasPrefix(line, libraryDir+"/") {
+			continue
+		}
+		lines[i] = filepath.ToSlash(filepath.Join(libraryDir, line)) + ending
+	}
+	return []byte(strings.Join(lines, "\n"))
 }
 
 func removeEmptyDirs(root string) error {
@@ -663,6 +498,7 @@ func removeEmptyDirs(root string) error {
 			if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+			continue
 		}
 	}
 	return nil
@@ -686,54 +522,277 @@ func fitPlan(plan []Planned, root string, free int64) []Planned {
 
 func transfer(plan []Planned, root string, dry bool, labels map[string]string) error {
 	started := time.Now()
-	total := totalBytes(plan)
+	pending := make([]Planned, 0, len(plan))
+	for _, item := range plan {
+		if !sameFile(item.Track.Location, filepath.Join(root, item.Relative)) {
+			pending = append(pending, item)
+		}
+	}
+	total := totalBytes(pending)
 	var done int64
-	for i, p := range plan {
-		dest := filepath.Join(root, filepath.Dir(p.Relative))
-		if err := os.MkdirAll(dest, 0755); err != nil {
-			return err
+	const maxBatchBytes int64 = 1 << 30
+	batches := make([][]Planned, 0)
+	for _, item := range pending {
+		if len(batches) == 0 || (batchBytes(batches[len(batches)-1])+item.Size > maxBatchBytes && len(batches[len(batches)-1]) > 0) {
+			batches = append(batches, nil)
 		}
-		args := []string{"-ah", "--partial", "--append-verify"}
-		if dry {
-			args = append(args, "--dry-run")
+		batches[len(batches)-1] = append(batches[len(batches)-1], item)
+	}
+	processed := 0
+	// ETA と速度は、完了した rsync バッチの実測時間だけから算出する。
+	// スピナーの再描画時刻を分母に含めると、バッチ転送中に見かけの速度が
+	// 毎秒下がり、ETA が毎秒増えてしまう。
+	var transferElapsed time.Duration
+	var displayMu sync.Mutex
+	printProgress := func(item Planned, spinner string) {
+		displayMu.Lock()
+		defer displayMu.Unlock()
+		rate, eta := transferEstimate(total, done, transferElapsed)
+		etaText := "-"
+		speed := "-"
+		if rate > 0 {
+			etaText = eta.Round(time.Second).String()
+			speed = humanBytes(rate) + "/s"
 		}
-		args = append(args, p.Track.Location, dest+string(os.PathSeparator))
-		if err := exec.Command("rsync", args...).Run(); err != nil {
-			fmt.Print("\033[2K\r")
-			return err
+		percent := 100.0
+		if total > 0 {
+			percent = float64(done) * 100 / float64(total)
 		}
-		done += p.Size
-		rate := float64(done) / time.Since(started).Seconds()
-		eta := time.Duration(float64(total-done)/rate) * time.Second
-		label := labels[p.Track.Location]
+		label := labels[item.Track.Location]
 		if label != "" {
 			label = " | プレイリスト: " + label
 		}
-		fmt.Printf("\033[2K\rETA %s | 転送中 [%d/%d] %5.1f%%%s | %s", eta.Round(time.Second), i+1, len(plan), float64(i+1)*100/float64(len(plan)), label, p.Track.Name)
+		activity := ""
+		if spinner != "" {
+			activity = " | コピー中 " + spinner
+		}
+		fmt.Printf("\033[2K\rETA %s | 速度 %s | 転送中 [%d/%d曲] %5.1f%% (%s/%s)%s | %s%s",
+			etaText, speed, processed, len(pending), percent,
+			humanBytes(done), humanBytes(total), label, truncateRunes(item.Track.Name, 20), activity)
+	}
+	for batchIndex, items := range batches {
+		stage, err := stagePlan(items)
+		if err != nil {
+			return err
+		}
+		func() {
+			defer os.RemoveAll(stage)
+			args := []string{"-ahL", "--partial", "--append-verify"}
+			if dry {
+				args = append(args, "--dry-run")
+			}
+			// 転送は常に1本で実行し、microSD上の帯域競合を避ける。
+			if len(items) > 0 {
+				printProgress(items[0], "|")
+			}
+			args = append(args, stage+string(os.PathSeparator), root+string(os.PathSeparator))
+			cmd := exec.Command("rsync", args...)
+			batchStarted := time.Now()
+			stopSpinner := make(chan struct{})
+			var spinnerWG sync.WaitGroup
+			if len(items) > 0 && !dry {
+				spinnerWG.Add(1)
+				go func(item Planned) {
+					defer spinnerWG.Done()
+					frames := []string{"|", "/", "-", "\\"}
+					frame := 0
+					ticker := time.NewTicker(time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ticker.C:
+							frame = (frame + 1) % len(frames)
+							printProgress(item, frames[frame])
+						case <-stopSpinner:
+							return
+						}
+					}
+				}(items[0])
+			}
+			runErr := cmd.Run()
+			close(stopSpinner)
+			spinnerWG.Wait()
+			if runErr != nil {
+				err = runErr
+				return
+			}
+			transferElapsed += time.Since(batchStarted)
+			for _, item := range items {
+				processed++
+				done += item.Size
+				printProgress(item, "")
+			}
+		}()
+		if err != nil {
+			fmt.Print("\033[2K\r")
+			return fmt.Errorf("転送バッチ %d/%d: %w", batchIndex+1, len(batches), err)
+		}
 	}
 	fmt.Print("\033[2K\r")
 	fmt.Println()
+	fmt.Printf("音源転送時間: %s\n", time.Since(started).Round(time.Second))
 	return nil
 }
 
-func writePlaylists(playlists []Playlist, plan []Planned, root string, dry bool) error {
-	available := map[string]bool{}
+func transferEstimate(total, done int64, elapsed time.Duration) (int64, time.Duration) {
+	if done <= 0 || elapsed <= 0 || total <= done {
+		return 0, 0
+	}
+	rate := int64(float64(done) / elapsed.Seconds())
+	if rate <= 0 {
+		return 0, 0
+	}
+	return rate, time.Duration(float64(total-done)/float64(rate)) * time.Second
+}
+
+func batchBytes(items []Planned) int64 {
+	var total int64
+	for _, item := range items {
+		total += item.Size
+	}
+	return total
+}
+
+func artworkBytes(plan []Planned, root string) (int64, error) {
+	seen := map[string]bool{}
+	var total int64
 	for _, item := range plan {
-		available[item.Track.Location] = true
+		if item.Track.Artwork == "" {
+			continue
+		}
+		destinationDir := filepath.Join(root, filepath.Dir(item.Relative))
+		if seen[destinationDir] {
+			continue
+		}
+		sourceInfo, err := os.Stat(item.Track.Artwork)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, err
+		}
+		if !sourceInfo.Mode().IsRegular() || sameFile(item.Track.Artwork, filepath.Join(destinationDir, "AlbumArt.jpg")) {
+			if sourceInfo.Mode().IsRegular() {
+				seen[destinationDir] = true
+			}
+			continue
+		}
+		seen[destinationDir] = true
+		total += sourceInfo.Size()
+	}
+	return total, nil
+}
+
+func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string]bool) error {
+	started := time.Now()
+	plannedDirs := map[string]string{}
+	sources := map[string]string{}
+	for _, item := range plan {
+		relativeDir := filepath.Dir(item.Relative)
+		destinationDir := filepath.Join(root, relativeDir)
+		plannedDirs[destinationDir] = relativeDir
+		if item.Track.Artwork == "" || sources[destinationDir] != "" {
+			continue
+		}
+		info, err := os.Stat(item.Track.Artwork)
+		if err == nil && info.Mode().IsRegular() {
+			sources[destinationDir] = item.Track.Artwork
+		}
+	}
+	available := 0
+	written := 0
+	for destinationDir, relativeDir := range plannedDirs {
+		if !artworkDirs[relativeDir] {
+			continue
+		}
+		destination := filepath.Join(destinationDir, "AlbumArt.jpg")
+		source := sources[destinationDir]
+		if source == "" {
+			if dry {
+				continue
+			}
+			if err := os.MkdirAll(destinationDir, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+		sourceInfo, err := os.Stat(source)
+		if err != nil || !sourceInfo.Mode().IsRegular() {
+			continue
+		}
+		available++
+		if dry {
+			continue
+		}
+		if err := os.MkdirAll(destinationDir, 0755); err != nil {
+			return err
+		}
+		if sameFile(source, destination) {
+			continue
+		}
+		written++
+		if err := copyFile(source, destination, sourceInfo.ModTime()); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("ジャケ写: %d件取得 / %d件配置（処理時間: %s）\n", available, written, time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func copyFile(source, destination string, modTime time.Time) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chtimes(destination, modTime, modTime)
+}
+
+func stagePlan(items []Planned) (string, error) {
+	stage, err := os.MkdirTemp("", "music-bridge-stage-")
+	if err != nil {
+		return "", err
+	}
+	for _, item := range items {
+		path := filepath.Join(stage, item.Relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			os.RemoveAll(stage)
+			return "", err
+		}
+		if err := os.Symlink(item.Track.Location, path); err != nil {
+			os.RemoveAll(stage)
+			return "", err
+		}
+	}
+	return stage, nil
+}
+
+func writePlaylists(playlists []Playlist, plan []Planned, root string, dry bool) error {
+	available := map[string]string{}
+	for _, item := range plan {
+		available[item.Track.Location] = filepath.ToSlash(item.Relative)
 	}
 	for i, p := range playlists {
 		fmt.Printf("プレイリスト生成中 [%d/%d] %s\n", i+1, len(playlists), p.Name)
 		var b strings.Builder
 		b.WriteString("#EXTM3U\n")
 		for _, t := range p.Tracks {
-			if t.Location == "" || !available[t.Location] {
+			relative, ok := available[t.Location]
+			if t.Location == "" || !ok {
 				continue
 			}
-			artist := t.AlbumArtist
-			if artist == "" {
-				artist = t.Artist
-			}
-			b.WriteString(filepath.ToSlash(filepath.Join(artist, t.Album, filepath.Base(t.Location))))
+			b.WriteString(relative)
 			b.WriteByte('\n')
 		}
 		if !dry {
