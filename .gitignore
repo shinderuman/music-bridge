@@ -7,3 +7,4 @@ __pycache__/
 # Go build artifacts
 alpha/go/music-bridge
 alpha/go/bin/
+dist/

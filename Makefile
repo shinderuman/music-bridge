@@ -1,19 +1,27 @@
 PREFIX ?= $(HOME)/.local
 LIBDIR := $(PREFIX)/lib/music-bridge
 BINDIR := $(PREFIX)/bin
+DISTDIR := dist/music-bridge
 
-.PHONY: build install uninstall
+.PHONY: all build install uninstall clean
+
+all: install
 
 build:
-	go build -o music-bridge ./alpha/go/cmd/music-bridge
+	rm -rf "$(DISTDIR)"
+	mkdir -p "$(DISTDIR)"
+	go build -o "$(DISTDIR)/music-bridge" ./alpha/go/cmd/music-bridge
+	cp -R scripts "$(DISTDIR)/scripts"
 
-install:
-	mkdir -p "$(LIBDIR)" "$(BINDIR)"
-	go build -o "$(LIBDIR)/music-bridge" ./alpha/go/cmd/music-bridge
-	rm -rf "$(LIBDIR)/scripts"
-	cp -R scripts "$(LIBDIR)/scripts"
+install: build
+	mkdir -p "$(PREFIX)/lib" "$(BINDIR)"
+	rm -rf "$(LIBDIR)"
+	cp -R "$(DISTDIR)" "$(LIBDIR)"
 	ln -sfn "../lib/music-bridge/music-bridge" "$(BINDIR)/music-bridge"
 
 uninstall:
 	rm -f "$(BINDIR)/music-bridge"
 	rm -rf "$(LIBDIR)"
+
+clean:
+	rm -rf dist

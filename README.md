@@ -70,12 +70,22 @@ go run ./cmd/music-bridge sync --target /Volumes/MUSIC_SD --dry-run
 go run ./cmd/music-bridge sync --refresh
 ```
 
+配布用の自己完結したディレクトリを作る場合:
+
+```bash
+make build
+```
+
+`dist/music-bridge/`にバイナリと必要な`scripts/`が作られます。このディレクトリごと任意の場所へ移動できます。
+
 どのディレクトリからでも`music-bridge`を実行できるようにインストールする場合:
 
 ```bash
-make install
+make
 music-bridge sync
 ```
+
+`make install`も同じく、ビルドしてからインストールします。
 
 `~/.local/bin`がPATHに含まれていない場合は、シェル設定へ追加してください。
 
