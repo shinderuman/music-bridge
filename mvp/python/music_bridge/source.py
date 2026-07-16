@@ -1,12 +1,11 @@
 import json
 import subprocess
-import time
 from pathlib import Path
 
 from .models import Playlist, load_playlists
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 JXA = ROOT / "scripts" / "export_music_library.js"
 
 
@@ -22,14 +21,6 @@ def get_playlists(source_json: Path | None = None, *, summary: bool = False, pla
             + sum((["--playlist", name] for name in (playlist_names or [])), []),
             text=True, stdout=subprocess.PIPE, stderr=None,
         )
-        started = time.monotonic()
-        next_status = started + 10
-        while process.poll() is None:
-            now = time.monotonic()
-            if now >= next_status:
-                print(f"  取得中... {int(now - started)}秒経過", flush=True)
-                next_status += 10
-            time.sleep(1)
         stdout, _ = process.communicate()
         completed = subprocess.CompletedProcess(
             process.args, process.returncode, stdout, ""

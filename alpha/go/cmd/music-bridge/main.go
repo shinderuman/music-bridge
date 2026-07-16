@@ -17,6 +17,7 @@ import (
 
 const dataDir = "music-bridge"
 const marker = ".music-bridge-target"
+const manifest = ".music-bridge-manifest.json"
 
 type Track struct {
 	Name        string `json:"name"`
@@ -65,7 +66,7 @@ func fatal(err error) { fmt.Fprintln(os.Stderr, "music-bridge:", err); os.Exit(1
 
 func sourceArgs(source string, summary bool, names []string) ([]string, error) {
 	if source == "" {
-		source = "mvp/python/scripts/export_music_library.js"
+		source = "scripts/export_music_library.js"
 	}
 	args := []string{"-l", "JavaScript", source}
 	if summary {
@@ -155,7 +156,7 @@ func chooseMany(playlists []Playlist, root string) ([]Playlist, error) {
 		seenNames[name] = true
 	}
 	for i, p := range playlists {
-		path := filepath.Join(root, "Music", safeName(p.Name)+".m3u")
+		path := filepath.Join(root, safeName(p.Name)+".m3u")
 		if _, err := os.Stat(path); err == nil {
 			selected[i] = true
 		}
@@ -357,7 +358,6 @@ func runSync(argv []string) error {
 	target := fs.String("target", "", "target volume")
 	initTarget := fs.Bool("init-target", false, "initialize target")
 	dryRun := fs.Bool("dry-run", false, "dry run")
-	yes := fs.Bool("yes", false, "skip confirmations")
 	source := fs.String("source-json", "", "JSON source")
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -370,10 +370,7 @@ func runSync(argv []string) error {
 	markerPath := filepath.Join(root, marker)
 	if _, err := os.Stat(markerPath); os.IsNotExist(err) {
 		if !*initTarget {
-			fmt.Printf("%sを初期化しますか？ [y/N] ", root)
-			var answer string
-			fmt.Scanln(&answer)
-			if strings.ToLower(answer) != "y" {
+			if !confirmDefaultYes(fmt.Sprintf("%sを初期化しますか？ [Y/n] ", root)) {
 				return fmt.Errorf("同期先の初期化をキャンセルしました")
 			}
 		}
@@ -396,6 +393,7 @@ func runSync(argv []string) error {
 	for i, p := range selected {
 		names[i] = p.Name
 	}
+	fmt.Println("選択したプレイリストの曲情報を取得中...")
 	playlists, err := loadPlaylists(*source, false, names)
 	if err != nil {
 		return err
@@ -407,6 +405,7 @@ func runSync(argv []string) error {
 	if len(missing) > 0 {
 		fmt.Printf("ローカルファイルなし: %d曲\n", len(missing))
 	}
+	cleanupPlan := append([]Planned(nil), plan...)
 	required, err := existingBytes(plan, root)
 	if err != nil {
 		return err
@@ -418,35 +417,19 @@ func runSync(argv []string) error {
 	fmt.Printf("選択プレイリスト: %d件 / 曲: %d曲\n", len(playlists), countTracks(playlists))
 	fmt.Printf("新規転送容量: %s / 空き容量: %s\n", humanBytes(required), humanBytes(free))
 	if required > free {
-		fmt.Print("容量不足です。空き容量の範囲で続行しますか？ [y/N] ")
-		var answer string
-		fmt.Scanln(&answer)
-		if strings.ToLower(answer) != "y" {
-			return fmt.Errorf("容量不足のため中断しました")
-		}
+		fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		fmt.Println("!!! 警告: 容量が不足しています。                  !!!")
+		fmt.Printf("!!! 必要容量: %s / 空き容量: %s / 不足: %s !!!\n", humanBytes(required), humanBytes(free), humanBytes(required-free))
+		fmt.Println("!!! 空き容量に収まる範囲で同期を続行します。      !!!")
 		plan = fitPlan(plan, root, free)
-	} else if !*yes {
-		fmt.Print("同期を開始しますか？ [y/N] ")
-		var answer string
-		fmt.Scanln(&answer)
-		if strings.ToLower(answer) != "y" {
-			return fmt.Errorf("ユーザーにより中断しました")
-		}
 	}
 	stale := stalePlaylists(summaries, selected, root)
 	if len(stale) > 0 {
-		fmt.Println("警告: 選択されなかったプレイリストのM3Uを削除します:")
-		for _, path := range stale {
-			fmt.Println("  削除:", path)
-		}
-		if !*yes {
-			fmt.Print("削除して続行しますか？ [y/N] ")
-			var answer string
-			fmt.Scanln(&answer)
-			if strings.ToLower(answer) != "y" {
-				return fmt.Errorf("プレイリスト削除をキャンセルしました")
-			}
-		}
+		fmt.Printf("警告: 選択されなかったプレイリストのM3Uを削除します（%d件）\n", len(stale))
+	}
+	toDelete, deleteBytes := staleAudio(cleanupPlan, root)
+	if len(toDelete) > 0 {
+		fmt.Printf("警告: 選択されなかった音源を削除します（%dファイル / %s）\n", len(toDelete), humanBytes(deleteBytes))
 	}
 	labels := map[string]string{}
 	for _, p := range playlists {
@@ -468,6 +451,17 @@ func runSync(argv []string) error {
 				return err
 			}
 		}
+		for _, path := range toDelete {
+			if err := os.Remove(filepath.Join(root, path)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		if err := removeEmptyDirs(root); err != nil {
+			return err
+		}
+		if err := saveManifest(root, plan); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("転送完了: %d/%d曲\n同期完了: %dプレイリスト\n", len(plan), len(plan), len(playlists))
 	return nil
@@ -479,6 +473,14 @@ func countTracks(playlists []Playlist) int {
 		total += len(p.Tracks)
 	}
 	return total
+}
+
+func confirmDefaultYes(prompt string) bool {
+	fmt.Print(prompt)
+	var answer string
+	fmt.Scanln(&answer)
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "" || answer == "y" || answer == "yes"
 }
 
 func makePlan(playlists []Playlist) ([]Planned, []string, error) {
@@ -580,7 +582,7 @@ func sameFile(source, destination string) bool {
 func existingBytes(plan []Planned, root string) (int64, error) {
 	var total int64
 	for _, p := range plan {
-		destination := filepath.Join(root, "Music", p.Relative)
+		destination := filepath.Join(root, p.Relative)
 		if !sameFile(p.Track.Location, destination) {
 			total += p.Size
 		}
@@ -588,10 +590,88 @@ func existingBytes(plan []Planned, root string) (int64, error) {
 	return total, nil
 }
 
+func loadManifest(root string) []string {
+	data, err := os.ReadFile(filepath.Join(root, manifest))
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	if json.Unmarshal(data, &paths) != nil {
+		return nil
+	}
+	return paths
+}
+
+func staleAudio(plan []Planned, root string) ([]string, int64) {
+	desired := map[string]bool{}
+	for _, item := range plan {
+		desired[item.Relative] = true
+	}
+	var stale []string
+	var total int64
+	for _, relative := range loadManifest(root) {
+		if desired[relative] {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(root, relative))
+		if err == nil && info.Mode().IsRegular() {
+			stale = append(stale, relative)
+			total += info.Size()
+		}
+	}
+	sort.Strings(stale)
+	return stale, total
+}
+
+func saveManifest(root string, plan []Planned) error {
+	paths := make([]string, 0, len(plan))
+	for _, item := range plan {
+		paths = append(paths, item.Relative)
+	}
+	sort.Strings(paths)
+	data, err := json.MarshalIndent(paths, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, manifest), append(data, '\n'), 0644)
+}
+
+func removeEmptyDirs(root string) error {
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != root && entry.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if len(entries) == 0 {
+			if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func fitPlan(plan []Planned, root string, free int64) []Planned {
 	result := []Planned{}
 	for _, p := range plan {
-		destination := filepath.Join(root, "Music", p.Relative)
+		destination := filepath.Join(root, p.Relative)
 		if sameFile(p.Track.Location, destination) {
 			result = append(result, p)
 			continue
@@ -609,7 +689,7 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 	total := totalBytes(plan)
 	var done int64
 	for i, p := range plan {
-		dest := filepath.Join(root, "Music", filepath.Dir(p.Relative))
+		dest := filepath.Join(root, filepath.Dir(p.Relative))
 		if err := os.MkdirAll(dest, 0755); err != nil {
 			return err
 		}
@@ -619,6 +699,7 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 		}
 		args = append(args, p.Track.Location, dest+string(os.PathSeparator))
 		if err := exec.Command("rsync", args...).Run(); err != nil {
+			fmt.Print("\033[2K\r")
 			return err
 		}
 		done += p.Size
@@ -628,8 +709,9 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 		if label != "" {
 			label = " | プレイリスト: " + label
 		}
-		fmt.Printf("転送中 [%d/%d] %5.1f%%%s | %s | ETA %s\r", i+1, len(plan), float64(i+1)*100/float64(len(plan)), label, p.Track.Name, eta.Round(time.Second))
+		fmt.Printf("\033[2K\rETA %s | 転送中 [%d/%d] %5.1f%%%s | %s", eta.Round(time.Second), i+1, len(plan), float64(i+1)*100/float64(len(plan)), label, p.Track.Name)
 	}
+	fmt.Print("\033[2K\r")
 	fmt.Println()
 	return nil
 }
@@ -655,7 +737,7 @@ func writePlaylists(playlists []Playlist, plan []Planned, root string, dry bool)
 			b.WriteByte('\n')
 		}
 		if !dry {
-			path := filepath.Join(root, "Music", safeName(p.Name)+".m3u")
+			path := filepath.Join(root, safeName(p.Name)+".m3u")
 			if err := os.WriteFile(path, append([]byte{0xef, 0xbb, 0xbf}, []byte(b.String())...), 0644); err != nil {
 				return err
 			}
@@ -673,7 +755,7 @@ func stalePlaylists(all, selected []Playlist, root string) []string {
 	for _, p := range all {
 		known[safeName(p.Name)] = true
 	}
-	entries, err := os.ReadDir(filepath.Join(root, "Music"))
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil
 	}
@@ -684,7 +766,7 @@ func stalePlaylists(all, selected []Playlist, root string) []string {
 		}
 		stem := strings.TrimSuffix(e.Name(), ".m3u")
 		if known[stem] && !wanted[stem] {
-			result = append(result, filepath.Join(root, "Music", e.Name()))
+			result = append(result, filepath.Join(root, e.Name()))
 		}
 	}
 	sort.Strings(result)
