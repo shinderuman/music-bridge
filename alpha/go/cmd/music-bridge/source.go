@@ -50,7 +50,7 @@ type playlistFingerprint struct {
 
 func sourceArgs(source string, summary bool, fingerprint bool, names []string, progressPrefix string) []string {
 	if source == "" {
-		source = "scripts/export_music_library.js"
+		source = bundledScript("export_music_library.js")
 	}
 	args := []string{"-l", "JavaScript", source}
 	if summary {
@@ -66,6 +66,21 @@ func sourceArgs(source string, summary bool, fingerprint bool, names []string, p
 		args = append(args, "--playlist", name)
 	}
 	return args
+}
+
+func bundledScript(name string) string {
+	if executable, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(executable); err == nil {
+			executable = resolved
+		}
+		candidate := filepath.Join(filepath.Dir(executable), "scripts", name)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate
+		}
+	}
+	// go run とリポジトリ直下でビルドした開発用バイナリでは、現在の
+	// 作業ディレクトリにある scripts/ を使う。
+	return filepath.Join("scripts", name)
 }
 
 func loadPlaylists(source string, summary bool, names []string) ([]Playlist, error) {
@@ -331,7 +346,7 @@ func exportArtworks(playlists []Playlist, artworkDir string, requests []artworkR
 	}
 	total := len(requests)
 	progressPath := filepath.Join(artworkDir, ".artwork-progress")
-	args := []string{"scripts/export_music_artwork.applescript", artworkDir, progressPath, requestPath, strconv.Itoa(total)}
+	args := []string{bundledScript("export_music_artwork.applescript"), artworkDir, progressPath, requestPath, strconv.Itoa(total)}
 	for _, playlist := range playlists {
 		args = append(args, playlist.Name)
 	}

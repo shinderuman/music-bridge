@@ -70,13 +70,14 @@ go run ./cmd/music-bridge sync --target /Volumes/MUSIC_SD --dry-run
 go run ./cmd/music-bridge sync --refresh
 ```
 
-ビルドして使う場合:
+どのディレクトリからでも`music-bridge`を実行できるようにインストールする場合:
 
 ```bash
-cd alpha/go
-go build -o music-bridge ./cmd/music-bridge
-./music-bridge sync
+make install
+music-bridge sync
 ```
+
+`~/.local/bin`がPATHに含まれていない場合は、シェル設定へ追加してください。
 
 ## 処理の流れ
 
