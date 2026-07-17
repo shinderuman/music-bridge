@@ -1,9 +1,11 @@
 package bridge
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +33,51 @@ func TestTransferEstimateUsesCompletedTransferTime(t *testing.T) {
 	}
 	if rate, eta := transferEstimate(300, 100, 0); rate != 0 || eta != 0 {
 		t.Fatalf("zero elapsed estimate = %d, %s; want 0, 0s", rate, eta)
+	}
+}
+
+func TestRetryTransferUsesOneTwoThreeSecondBackoff(t *testing.T) {
+	attempts := 0
+	var delays []time.Duration
+	err := retryTransfer(func() error {
+		attempts++
+		if attempts <= maxTransferRetries {
+			return os.ErrNotExist
+		}
+		return nil
+	}, func(delay time.Duration) {
+		delays = append(delays, delay)
+	}, func(int, time.Duration) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts = %d, want 4", attempts)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 3 * time.Second}
+	if !reflect.DeepEqual(delays, want) {
+		t.Fatalf("delays = %v, want %v", delays, want)
+	}
+}
+
+func TestRetryTransferStopsAfterThreeRetries(t *testing.T) {
+	attempts := 0
+	var delays []time.Duration
+	want := os.ErrNotExist
+	err := retryTransfer(func() error {
+		attempts++
+		return want
+	}, func(delay time.Duration) {
+		delays = append(delays, delay)
+	}, func(int, time.Duration) {})
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts = %d, want 4", attempts)
+	}
+	if got := len(delays); got != maxTransferRetries {
+		t.Fatalf("retry waits = %d, want %d", got, maxTransferRetries)
 	}
 }
 

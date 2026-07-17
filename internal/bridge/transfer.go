@@ -47,6 +47,20 @@ func (p *transferProgress) snapshot() (Planned, int64, int, int64, time.Duration
 	return p.item, p.done, p.processed, p.rate, p.eta
 }
 
+const maxTransferRetries = 3
+
+func retryTransfer(run func() error, sleep func(time.Duration), onRetry func(int, time.Duration)) error {
+	for retry := 0; ; retry++ {
+		err := run()
+		if err == nil || retry == maxTransferRetries {
+			return err
+		}
+		delay := time.Duration(retry+1) * time.Second
+		onRetry(retry+1, delay)
+		sleep(delay)
+	}
+}
+
 func transfer(plan []Planned, root string, dry bool, labels map[string]string) error {
 	started := time.Now()
 	pending := make([]Planned, 0, len(plan))
@@ -108,38 +122,7 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 				progress.startBatch(items[0])
 				printProgress(items[0], "|")
 			}
-			args = append(args, stage+string(os.PathSeparator), root+string(os.PathSeparator))
-			cmd := exec.Command("rsync", args...)
-			cmd.Stderr = diagnosticWriter()
-			logf("rsync batch %d/%d: rsync %s", batchIndex+1, len(batches), strings.Join(args, " "))
-			stdout, pipeErr := cmd.StdoutPipe()
-			if pipeErr != nil {
-				err = pipeErr
-				return
-			}
 			batchStarted := time.Now()
-			stopSpinner := make(chan struct{})
-			var spinnerWG sync.WaitGroup
-			if len(items) > 0 && !dry {
-				spinnerWG.Add(1)
-				go func() {
-					defer spinnerWG.Done()
-					frames := []string{"|", "/", "-", "\\"}
-					frame := 0
-					ticker := time.NewTicker(time.Second)
-					defer ticker.Stop()
-					for {
-						select {
-						case <-ticker.C:
-							frame = (frame + 1) % len(frames)
-							item, _, _, _, _ := progress.snapshot()
-							printProgress(item, frames[frame])
-						case <-stopSpinner:
-							return
-						}
-					}
-				}()
-			}
 			batchItems := make(map[string]Planned, len(items))
 			for _, item := range items {
 				batchItems[filepath.Clean(item.Relative)] = item
@@ -152,31 +135,68 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 				progress.complete(item, total, transferElapsed+time.Since(batchStarted), item.Size)
 				printProgress(item, "")
 			}
-			if startErr := cmd.Start(); startErr != nil {
-				err = startErr
-				return
-			}
-			scanDone := make(chan error, 1)
-			go func() {
-				scanner := bufio.NewScanner(stdout)
-				scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-				for scanner.Scan() {
-					if item, ok := rsyncItemForOutput(batchItems, scanner.Text()); ok {
-						complete(item)
-					}
+			attempt := 0
+			err = retryTransfer(func() error {
+				attempt++
+				attemptArgs := append(append([]string(nil), args...), stage+string(os.PathSeparator), root+string(os.PathSeparator))
+				cmd := exec.Command("rsync", attemptArgs...)
+				cmd.Stderr = diagnosticWriter()
+				logf("rsync batch %d/%d attempt %d/%d: rsync %s", batchIndex+1, len(batches), attempt, maxTransferRetries+1, strings.Join(attemptArgs, " "))
+				stdout, pipeErr := cmd.StdoutPipe()
+				if pipeErr != nil {
+					return pipeErr
 				}
-				scanDone <- scanner.Err()
-			}()
-			runErr := cmd.Wait()
-			scanErr := <-scanDone
-			close(stopSpinner)
-			spinnerWG.Wait()
-			if runErr != nil {
-				err = runErr
-				return
-			}
-			if scanErr != nil {
-				err = scanErr
+				stopSpinner := make(chan struct{})
+				var spinnerWG sync.WaitGroup
+				if len(items) > 0 && !dry {
+					spinnerWG.Add(1)
+					go func() {
+						defer spinnerWG.Done()
+						frames := []string{"|", "/", "-", "\\"}
+						frame := 0
+						ticker := time.NewTicker(time.Second)
+						defer ticker.Stop()
+						for {
+							select {
+							case <-ticker.C:
+								frame = (frame + 1) % len(frames)
+								item, _, _, _, _ := progress.snapshot()
+								printProgress(item, frames[frame])
+							case <-stopSpinner:
+								return
+							}
+						}
+					}()
+				}
+				if startErr := cmd.Start(); startErr != nil {
+					close(stopSpinner)
+					spinnerWG.Wait()
+					return startErr
+				}
+				scanDone := make(chan error, 1)
+				go func() {
+					scanner := bufio.NewScanner(stdout)
+					scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+					for scanner.Scan() {
+						if item, ok := rsyncItemForOutput(batchItems, scanner.Text()); ok {
+							complete(item)
+						}
+					}
+					scanDone <- scanner.Err()
+				}()
+				runErr := cmd.Wait()
+				scanErr := <-scanDone
+				close(stopSpinner)
+				spinnerWG.Wait()
+				if runErr != nil {
+					return runErr
+				}
+				return scanErr
+			}, time.Sleep, func(retry int, delay time.Duration) {
+				fmt.Print("\033[2K\r")
+				fmt.Printf("転送バッチ %d/%dでエラー。%s後にリトライします（%d/%d）\n", batchIndex+1, len(batches), delay, retry, maxTransferRetries)
+			})
+			if err != nil {
 				return
 			}
 			transferElapsed += time.Since(batchStarted)
