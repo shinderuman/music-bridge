@@ -2,12 +2,16 @@ package bridge
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
+
+const syncLock = ".music-bridge-sync.lock"
 
 func loadManifest(root string) []string {
 	data, err := os.ReadFile(filepath.Join(root, manifest))
@@ -19,6 +23,24 @@ func loadManifest(root string) []string {
 		return nil
 	}
 	return paths
+}
+
+func lockTarget(root string) (func(), error) {
+	file, err := os.OpenFile(filepath.Join(root, syncLock), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("この同期先は別のmusic-bridgeが同期中です: %s", root)
+		}
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, nil
 }
 
 func staleAudio(plan []Planned, root string) ([]string, int64) {

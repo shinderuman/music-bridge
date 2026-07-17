@@ -72,6 +72,11 @@ func runSync(argv []string) error {
 			return err
 		}
 	}
+	unlock, err := lockTarget(root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if !*dryRun {
 		if err := migrateLegacyLayout(root); err != nil {
 			return err

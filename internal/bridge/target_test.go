@@ -1,9 +1,13 @@
 package bridge
 
 import (
+	"bufio"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,6 +53,77 @@ func TestSameFile(t *testing.T) {
 	if sameFile(a, b) {
 		t.Fatal("large timestamp differences should not be ignored")
 	}
+}
+
+func TestLockTargetRejectsConcurrentSyncForSameTarget(t *testing.T) {
+	root := t.TempDir()
+	unlock, err := lockTarget(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	if _, err := lockTarget(root); err == nil {
+		t.Fatal("second lock for the same target succeeded")
+	}
+	unlock()
+	unlockAgain, err := lockTarget(root)
+	if err != nil {
+		t.Fatalf("lock was not released: %v", err)
+	}
+	unlockAgain()
+}
+
+func TestLockTargetIsReleasedAfterSIGINT(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command(os.Args[0], "-test.run=^TestLockTargetSignalHelper$")
+	command.Env = append(os.Environ(), "MUSIC_BRIDGE_LOCK_TEST_ROOT="+root)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(line) != "locked" {
+		t.Fatalf("helper output = %q, want locked", line)
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("helper unexpectedly exited without SIGINT")
+	}
+	unlock, err := lockTarget(root)
+	if err != nil {
+		t.Fatalf("lock remained after SIGINT: %v", err)
+	}
+	unlock()
+}
+
+func TestLockTargetSignalHelper(t *testing.T) {
+	root := os.Getenv("MUSIC_BRIDGE_LOCK_TEST_ROOT")
+	if root == "" {
+		return
+	}
+	unlock, err := lockTarget(root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	defer unlock()
+	fmt.Println("locked")
+	select {}
 }
 
 func TestStaleAudioUsesManifestAndSelectedUnion(t *testing.T) {
