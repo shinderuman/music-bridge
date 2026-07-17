@@ -15,11 +15,17 @@ var diagnosticLog struct {
 	path string
 }
 
+var diagnosticLogHome = os.UserHomeDir
+
 func startDiagnosticLog() (func(), error) {
-	home, err := os.UserHomeDir()
+	home, err := diagnosticLogHome()
 	if err != nil {
 		return nil, err
 	}
+	return startDiagnosticLogIn(home)
+}
+
+func startDiagnosticLogIn(home string) (func(), error) {
 	dir := filepath.Join(home, "Library", "Logs", "Music Bridge")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err

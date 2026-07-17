@@ -87,3 +87,30 @@ func TestRsyncOutFormatListsTransferredFile(t *testing.T) {
 		t.Fatalf("rsync output %q does not contain %q", output, relative)
 	}
 }
+
+func TestTransferCopiesPendingFile(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync is not installed")
+	}
+	source := filepath.Join(t.TempDir(), "song.m4a")
+	if err := os.WriteFile(source, []byte("song data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	relative := filepath.Join("Library", "Artist", "Album", "song.m4a")
+	plan := []Planned{{
+		Track:    Track{Name: "song", Location: source},
+		Relative: relative,
+		Size:     int64(len("song data")),
+	}}
+	if err := transfer(plan, root, false, map[string]string{source: "Playlist"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "song data" {
+		t.Fatalf("transferred data = %q", data)
+	}
+}
