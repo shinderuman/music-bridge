@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,6 +77,8 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 			}
 			args = append(args, stage+string(os.PathSeparator), root+string(os.PathSeparator))
 			cmd := exec.Command("rsync", args...)
+			cmd.Stderr = diagnosticWriter()
+			logf("rsync batch %d/%d: rsync %s", batchIndex+1, len(batches), strings.Join(args, " "))
 			batchStarted := time.Now()
 			stopSpinner := make(chan struct{})
 			var spinnerWG sync.WaitGroup

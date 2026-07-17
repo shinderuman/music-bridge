@@ -21,18 +21,30 @@ type Planned struct {
 }
 
 func Run(argv []string) error {
+	closeLog, logErr := startDiagnosticLog()
+	if logErr == nil {
+		defer closeLog()
+	}
+	var err error
 	if len(argv) < 1 {
-		return fmt.Errorf("サブコマンドを指定してください")
+		err = fmt.Errorf("サブコマンドを指定してください")
+	} else {
+		switch argv[0] {
+		case "playlists":
+			err = runPlaylists(argv[1:])
+		case "sync":
+			err = runSync(argv[1:])
+		default:
+			err = fmt.Errorf("不明なサブコマンド: %s", argv[0])
+		}
 	}
-	switch argv[0] {
-	case "playlists":
-		return runPlaylists(argv[1:])
-	case "sync":
-		return runSync(argv[1:])
-	default:
-		return fmt.Errorf("不明なサブコマンド: %s", argv[0])
+	if err != nil {
+		logf("error: %v", err)
 	}
+	return err
 }
+
+func DiagnosticLogPath() string { return diagnosticLogPath() }
 
 func NotifyCompletion() {
 	// Terminal.appはBELでDockバッジ・Dockアイコンのバウンスを表示できる。
