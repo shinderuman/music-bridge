@@ -85,3 +85,27 @@ func TestWriteArtworksCreatesDirectoryForMissingArtwork(t *testing.T) {
 		t.Fatalf("missing artwork album directory was not created: %v", err)
 	}
 }
+
+func TestWriteArtworksCopiesAlbumArt(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.jpg")
+	if err := os.WriteFile(source, []byte("artwork"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Unix(1700000000, 0)
+	if err := os.Chtimes(source, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	plan := []Planned{{Track: Track{Artwork: source}, Relative: "Library/Artist/Album/song.m4a"}}
+	dirs := map[string]bool{"Library/Artist/Album": true}
+	if err := writeArtworks(plan, root, false, dirs); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "Library/Artist/Album/AlbumArt.jpg")
+	if data, err := os.ReadFile(destination); err != nil || string(data) != "artwork" {
+		t.Fatalf("artwork = %q, %v", data, err)
+	}
+	if info, err := os.Stat(destination); err != nil || !info.ModTime().Equal(stamp) {
+		t.Fatalf("artwork modtime = %v, %v", info.ModTime(), err)
+	}
+}

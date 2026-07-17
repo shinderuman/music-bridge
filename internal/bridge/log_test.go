@@ -82,4 +82,7 @@ func TestRunLogsError(t *testing.T) {
 	if !strings.Contains(string(data), "error: サブコマンドは廃止されました") {
 		t.Fatalf("diagnostic log = %q", data)
 	}
+	if got, want := DiagnosticLogPath(), diagnosticLogPath(); got != want {
+		t.Fatalf("DiagnosticLogPath = %q, want %q", got, want)
+	}
 }

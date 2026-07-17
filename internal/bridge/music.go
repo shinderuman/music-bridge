@@ -31,6 +31,13 @@ type Playlist struct {
 
 const playlistCacheVersion = 2
 
+var (
+	playlistCacheLocation = playlistCachePath
+	playlistFingerprints  = loadPlaylistFingerprints
+	playlistDetails       = loadPlaylistsWithProgress
+	executablePath        = os.Executable
+)
+
 type playlistCache struct {
 	Version   int                       `json:"version"`
 	Playlists map[string]cachedPlaylist `json:"playlists"`
@@ -68,7 +75,7 @@ func sourceArgs(source string, summary bool, fingerprint bool, names []string, p
 }
 
 func bundledScript(name string) string {
-	if executable, err := os.Executable(); err == nil {
+	if executable, err := executablePath(); err == nil {
 		if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 			executable = resolved
 		}
@@ -161,7 +168,7 @@ func loadSyncPlaylists(source string, selected []Playlist, refresh bool) ([]Play
 		fmt.Println("選択したプレイリストの曲情報を取得中...")
 		return loadPlaylists(source, false, names)
 	}
-	path, err := playlistCachePath()
+	path, err := playlistCacheLocation()
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +176,7 @@ func loadSyncPlaylists(source string, selected []Playlist, refresh bool) ([]Play
 	if cache.Playlists == nil {
 		cache.Playlists = map[string]cachedPlaylist{}
 	}
-	fingerprints, err := loadPlaylistFingerprints(names)
+	fingerprints, err := playlistFingerprints(names)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +204,7 @@ func loadSyncPlaylists(source string, selected []Playlist, refresh bool) ([]Play
 		}
 		for index, name := range fetchNames {
 			progressPrefix := fmt.Sprintf("曲情報を取得中 [%d/%d] %s", index+1, len(fetchNames), name)
-			fetched, err := loadPlaylistsWithProgress("", false, []string{name}, progressPrefix)
+			fetched, err := playlistDetails("", false, []string{name}, progressPrefix)
 			if err != nil {
 				return nil, err
 			}
