@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,42 @@ import (
 	"sync"
 	"time"
 )
+
+func rsyncItemForOutput(items map[string]Planned, line string) (Planned, bool) {
+	relative := filepath.Clean(filepath.FromSlash(strings.TrimSpace(line)))
+	item, ok := items[relative]
+	return item, ok
+}
+
+type transferProgress struct {
+	mu        sync.Mutex
+	item      Planned
+	done      int64
+	processed int
+	rate      int64
+	eta       time.Duration
+}
+
+func (p *transferProgress) startBatch(item Planned) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.item = item
+}
+
+func (p *transferProgress) complete(item Planned, total int64, elapsed time.Duration, size int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.item = item
+	p.processed++
+	p.done += size
+	p.rate, p.eta = transferEstimate(total, p.done, elapsed)
+}
+
+func (p *transferProgress) snapshot() (Planned, int64, int, int64, time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.item, p.done, p.processed, p.rate, p.eta
+}
 
 func transfer(plan []Planned, root string, dry bool, labels map[string]string) error {
 	started := time.Now()
@@ -19,7 +56,6 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 		}
 	}
 	total := totalBytes(pending)
-	var done int64
 	const maxBatchBytes int64 = 1 << 30
 	batches := make([][]Planned, 0)
 	for _, item := range pending {
@@ -28,16 +64,12 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 		}
 		batches[len(batches)-1] = append(batches[len(batches)-1], item)
 	}
-	processed := 0
-	// ETA と速度は、完了した rsync バッチの実測時間だけから算出する。
-	// スピナーの再描画時刻を分母に含めると、バッチ転送中に見かけの速度が
-	// 毎秒下がり、ETA が毎秒増えてしまう。
+	// ETA と速度は曲の完了時だけ更新する。スピナーの再描画で再計算すると、
+	// 実転送量が増えないまま速度だけ下がり、ETAが毎秒増えてしまう。
 	var transferElapsed time.Duration
-	var displayMu sync.Mutex
+	progress := &transferProgress{}
 	printProgress := func(item Planned, spinner string) {
-		displayMu.Lock()
-		defer displayMu.Unlock()
-		rate, eta := transferEstimate(total, done, transferElapsed)
+		_, done, processed, rate, eta := progress.snapshot()
 		etaText := "-"
 		speed := "-"
 		if rate > 0 {
@@ -67,24 +99,30 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 		}
 		func() {
 			defer os.RemoveAll(stage)
-			args := []string{"-ahL", "--partial", "--append-verify"}
+			args := []string{"-ahL", "--partial", "--append-verify", "--out-format=%n"}
 			if dry {
 				args = append(args, "--dry-run")
 			}
 			// 転送は常に1本で実行し、microSD上の帯域競合を避ける。
 			if len(items) > 0 {
+				progress.startBatch(items[0])
 				printProgress(items[0], "|")
 			}
 			args = append(args, stage+string(os.PathSeparator), root+string(os.PathSeparator))
 			cmd := exec.Command("rsync", args...)
 			cmd.Stderr = diagnosticWriter()
 			logf("rsync batch %d/%d: rsync %s", batchIndex+1, len(batches), strings.Join(args, " "))
+			stdout, pipeErr := cmd.StdoutPipe()
+			if pipeErr != nil {
+				err = pipeErr
+				return
+			}
 			batchStarted := time.Now()
 			stopSpinner := make(chan struct{})
 			var spinnerWG sync.WaitGroup
 			if len(items) > 0 && !dry {
 				spinnerWG.Add(1)
-				go func(item Planned) {
+				go func() {
 					defer spinnerWG.Done()
 					frames := []string{"|", "/", "-", "\\"}
 					frame := 0
@@ -94,25 +132,56 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 						select {
 						case <-ticker.C:
 							frame = (frame + 1) % len(frames)
+							item, _, _, _, _ := progress.snapshot()
 							printProgress(item, frames[frame])
 						case <-stopSpinner:
 							return
 						}
 					}
-				}(items[0])
+				}()
 			}
-			runErr := cmd.Run()
+			batchItems := make(map[string]Planned, len(items))
+			for _, item := range items {
+				batchItems[filepath.Clean(item.Relative)] = item
+			}
+			complete := func(item Planned) {
+				if _, pending := batchItems[filepath.Clean(item.Relative)]; !pending {
+					return
+				}
+				delete(batchItems, filepath.Clean(item.Relative))
+				progress.complete(item, total, transferElapsed+time.Since(batchStarted), item.Size)
+				printProgress(item, "")
+			}
+			if startErr := cmd.Start(); startErr != nil {
+				err = startErr
+				return
+			}
+			scanDone := make(chan error, 1)
+			go func() {
+				scanner := bufio.NewScanner(stdout)
+				scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+				for scanner.Scan() {
+					if item, ok := rsyncItemForOutput(batchItems, scanner.Text()); ok {
+						complete(item)
+					}
+				}
+				scanDone <- scanner.Err()
+			}()
+			runErr := cmd.Wait()
+			scanErr := <-scanDone
 			close(stopSpinner)
 			spinnerWG.Wait()
 			if runErr != nil {
 				err = runErr
 				return
 			}
+			if scanErr != nil {
+				err = scanErr
+				return
+			}
 			transferElapsed += time.Since(batchStarted)
 			for _, item := range items {
-				processed++
-				done += item.Size
-				printProgress(item, "")
+				complete(item)
 			}
 		}()
 		if err != nil {

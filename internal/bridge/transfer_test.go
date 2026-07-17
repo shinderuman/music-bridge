@@ -1,6 +1,10 @@
 package bridge
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,5 +31,59 @@ func TestTransferEstimateUsesCompletedTransferTime(t *testing.T) {
 	}
 	if rate, eta := transferEstimate(300, 100, 0); rate != 0 || eta != 0 {
 		t.Fatalf("zero elapsed estimate = %d, %s; want 0, 0s", rate, eta)
+	}
+}
+
+func TestTransferProgressKeepsLastCompletedItemAndLiveElapsedRate(t *testing.T) {
+	first := Planned{Relative: "Library/A/first.m4a", Size: 100}
+	second := Planned{Relative: "Library/A/second.m4a", Size: 100}
+	progress := &transferProgress{}
+	progress.startBatch(first)
+	item, done, processed, rate, _ := progress.snapshot()
+	if item != first || done != 0 || processed != 0 || rate != 0 {
+		t.Fatalf("initial progress = %#v, %d, %d, %d", item, done, processed, rate)
+	}
+	progress.complete(second, 1000, 5*time.Second, second.Size)
+	item, done, processed, rate, eta := progress.snapshot()
+	if item != second || done != 100 || processed != 1 || rate != 20 || eta != 45*time.Second {
+		t.Fatalf("completed progress = %#v, %d, %d, %d, %s", item, done, processed, rate, eta)
+	}
+	item, _, _, _, _ = progress.snapshot()
+	if item != second {
+		t.Fatalf("spinner item changed to %#v, want %#v", item, second)
+	}
+}
+
+func TestRsyncItemForOutput(t *testing.T) {
+	item := Planned{Relative: "Library/Artist/Album/song.m4a"}
+	items := map[string]Planned{item.Relative: item}
+	if got, ok := rsyncItemForOutput(items, "Library/Artist/Album/song.m4a"); !ok || got != item {
+		t.Fatalf("rsync output item = %#v, %v", got, ok)
+	}
+	if _, ok := rsyncItemForOutput(items, "Library/Artist/Album"); ok {
+		t.Fatal("directory output must not be treated as a transferred track")
+	}
+}
+
+func TestRsyncOutFormatListsTransferredFile(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync is not installed")
+	}
+	source := t.TempDir()
+	target := t.TempDir()
+	relative := filepath.Join("Library", "Artist", "Album", "song.m4a")
+	path := filepath.Join(source, relative)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("song"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command("rsync", "-ahL", "--out-format=%n", source+string(os.PathSeparator), target+string(os.PathSeparator)).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output), filepath.ToSlash(relative)) {
+		t.Fatalf("rsync output %q does not contain %q", output, relative)
 	}
 }
