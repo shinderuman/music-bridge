@@ -69,6 +69,26 @@ function bulkTrackProperties(playlist, sourceTracks) {
   return null;
 }
 
+function waitForPlaylists(app, started) {
+  const timeoutSeconds = 60;
+  for (let elapsed = 0; elapsed < timeoutSeconds; elapsed++) {
+    try {
+      // 起動直後のMusic.appはプレイリスト数だけ返し、個々のオブジェクトはまだ
+      // 取得できないことがある。全件の名前を個別に取得できるまで待機する。
+      const playlists = app.userPlaylists();
+      const ready = playlists.length > 0 && playlists.every((playlist) => playlist.name() !== null && playlist.name() !== undefined);
+      if (ready) {
+        return playlists;
+      }
+    } catch (error) {
+      // Music.appのライブラリ初期化中は -1728 になるため、起動完了まで待つ。
+    }
+    status("Music.appの起動完了を待機中...", started, 0, 0);
+    delay(1);
+  }
+  throw new Error(`Music.appの起動完了を${timeoutSeconds}秒待ちましたが、プレイリストを取得できませんでした`);
+}
+
 function run(argv) {
   argv = argv || [];
   const summary = argv.indexOf("--summary") !== -1;
@@ -83,7 +103,7 @@ function run(argv) {
   app.includeStandardAdditions = true;
   const result = [];
   const started = Date.now();
-  const playlists = app.userPlaylists().filter((playlist) =>
+  const playlists = waitForPlaylists(app, started).filter((playlist) =>
     requested.length === 0 || requested.indexOf(playlist.name()) !== -1
   );
   status(`プレイリスト ${playlists.length}件を検出しました`, started, 0, 0);

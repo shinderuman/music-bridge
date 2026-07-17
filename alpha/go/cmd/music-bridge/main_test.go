@@ -32,6 +32,16 @@ func TestHumanBytes(t *testing.T) {
 	}
 }
 
+func TestValidatePlanRejectsMissingSourceVolume(t *testing.T) {
+	playlists := []Playlist{{Name: "P", Tracks: []Track{{Name: "song", Location: "/not-mounted/song.m4a"}}}}
+	if err := validatePlan(nil, playlists); err == nil {
+		t.Fatal("empty plan with selected tracks must be rejected")
+	}
+	if err := validatePlan(nil, []Playlist{{Name: "Empty"}}); err != nil {
+		t.Fatalf("empty playlist must be allowed: %v", err)
+	}
+}
+
 func TestSameFile(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a")

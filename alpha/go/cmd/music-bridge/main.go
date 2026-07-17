@@ -120,6 +120,9 @@ func runSync(argv []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validatePlan(plan, playlists); err != nil {
+		return err
+	}
 	artworkDirs := map[string]bool{}
 	if !*dryRun {
 		// 容量不足の場合、今回の同期対象にならない曲のジャケ写を取得しても
@@ -232,6 +235,13 @@ func countTracks(playlists []Playlist) int {
 		total += len(p.Tracks)
 	}
 	return total
+}
+
+func validatePlan(plan []Planned, playlists []Playlist) error {
+	if len(plan) == 0 && countTracks(playlists) > 0 {
+		return fmt.Errorf("同期可能なローカル音源がありません。Musicライブラリの保存先ボリュームが接続されているか確認してください")
+	}
+	return nil
 }
 
 func confirmDefaultYes(prompt string) bool {
