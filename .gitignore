@@ -5,6 +5,6 @@ __pycache__/
 .DS_Store
 
 # Go build artifacts
-alpha/go/music-bridge
-alpha/go/bin/
+/music-bridge
+/bin/
 dist/

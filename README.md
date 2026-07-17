@@ -38,11 +38,9 @@ Androidで再生できる音源 + M3U + AlbumArt
 
 ## 使い方
 
-Go版は `alpha/go` がモジュールのルートです。
+リポジトリ直下がGoモジュールのルートです。
 
 ```bash
-cd alpha/go
-
 # Music.appで認識しているプレイリストを確認
 go run ./cmd/music-bridge playlists
 

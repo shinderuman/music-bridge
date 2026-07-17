@@ -10,7 +10,7 @@ all: install
 build:
 	rm -rf "$(DISTDIR)"
 	mkdir -p "$(DISTDIR)"
-	go build -o "$(DISTDIR)/music-bridge" ./alpha/go/cmd/music-bridge
+	go build -o "$(DISTDIR)/music-bridge" ./cmd/music-bridge
 	cp -R scripts "$(DISTDIR)/scripts"
 
 install: build
