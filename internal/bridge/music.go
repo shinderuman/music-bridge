@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -419,24 +418,4 @@ func filterPlaylists(all []Playlist, names []string) []Playlist {
 		}
 	}
 	return result
-}
-
-func runPlaylists(argv []string) error {
-	fs := flag.NewFlagSet("playlists", flag.ContinueOnError)
-	source := fs.String("source-json", "", "JSON source")
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-	playlists, err := loadPlaylists(*source, true, nil)
-	if err != nil {
-		return err
-	}
-	for _, p := range playlists {
-		count := p.TrackCount
-		if count == 0 {
-			count = len(p.Tracks)
-		}
-		fmt.Printf("%s\t%d曲\n", p.Name, count)
-	}
-	return nil
 }

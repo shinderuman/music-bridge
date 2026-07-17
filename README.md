@@ -41,23 +41,20 @@ Androidで再生できる音源 + M3U + AlbumArt
 リポジトリ直下がGoモジュールのルートです。
 
 ```bash
-# Music.appで認識しているプレイリストを確認
-go run ./cmd/music-bridge playlists
-
 # 同期先とプレイリストを選んで同期
-go run ./cmd/music-bridge sync
+go run ./cmd/music-bridge
 ```
 
 初めて使うストレージでは、専用ディレクトリを初期化します。
 
 ```bash
-go run ./cmd/music-bridge sync --target /Volumes/MUSIC_SD --init-target
+go run ./cmd/music-bridge --target /Volumes/MUSIC_SD --init-target
 ```
 
 実際にはコピー・削除せず、同期内容を確認するには `--dry-run` を使います。
 
 ```bash
-go run ./cmd/music-bridge sync --target /Volumes/MUSIC_SD --dry-run
+go run ./cmd/music-bridge --target /Volumes/MUSIC_SD --dry-run
 ```
 
 初回の同期では選択したプレイリストの曲情報をMusic.appから取得し、Macのキャッシュへ保存します。以後は、Music.appから曲ID一覧だけを読み取ってキャッシュと照合し、曲の追加・削除・入れ替え・並び順が変わったプレイリストだけ詳細情報を再取得します。詳細情報はプレイリストごとにキャッシュへ保存するため、途中で同期が中断しても、取得済みプレイリストのキャッシュは次回利用できます。
@@ -65,7 +62,7 @@ go run ./cmd/music-bridge sync --target /Volumes/MUSIC_SD --dry-run
 曲名・アーティスト名・アルバム名などのタグ変更を反映したい場合は、`--refresh` で選択したプレイリストの詳細情報をすべて更新してください。
 
 ```bash
-go run ./cmd/music-bridge sync --refresh
+go run ./cmd/music-bridge --refresh
 ```
 
 配布用の自己完結したディレクトリを作る場合:
@@ -80,7 +77,7 @@ make build
 
 ```bash
 make
-music-bridge sync
+music-bridge
 ```
 
 `make install`も同じく、ビルドしてからインストールします。
@@ -93,7 +90,7 @@ music-bridge sync
 
 ```mermaid
 flowchart TD
-    start["music-bridge sync"] --> target["同期先ボリュームを選択"]
+    start["music-bridge"] --> target["同期先ボリュームを選択"]
     target --> marker{"同期先のマーカーを確認\n(microSDXC: 読み取り)"}
     marker -->|初回のみ| initialize["music-bridgeディレクトリを初期化\n(microSDXC: 書き込み)"]
     marker --> summary["Music.appからプレイリスト一覧を取得"]

@@ -25,19 +25,7 @@ func Run(argv []string) error {
 	if logErr == nil {
 		defer closeLog()
 	}
-	var err error
-	if len(argv) < 1 {
-		err = fmt.Errorf("サブコマンドを指定してください")
-	} else {
-		switch argv[0] {
-		case "playlists":
-			err = runPlaylists(argv[1:])
-		case "sync":
-			err = runSync(argv[1:])
-		default:
-			err = fmt.Errorf("不明なサブコマンド: %s", argv[0])
-		}
-	}
+	err := runSync(argv)
 	if err != nil {
 		logf("error: %v", err)
 	}
@@ -61,6 +49,9 @@ func runSync(argv []string) error {
 	source := fs.String("source-json", "", "JSON source")
 	if err := fs.Parse(argv); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("サブコマンドは廃止されました。music-bridge [options] で実行してください")
 	}
 	volume, err := chooseTarget(*target)
 	if err != nil {
