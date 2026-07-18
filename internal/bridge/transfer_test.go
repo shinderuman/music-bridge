@@ -81,6 +81,13 @@ func TestRetryTransferStopsAfterThreeRetries(t *testing.T) {
 	}
 }
 
+func TestRsyncEnvironmentDisablesAppleDoubleFiles(t *testing.T) {
+	got := rsyncEnvironment([]string{"PATH=/bin"})
+	if want := []string{"PATH=/bin", "COPYFILE_DISABLE=1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("rsync environment=%#v, want %#v", got, want)
+	}
+}
+
 func TestTransferProgressKeepsLastCompletedItemAndLiveElapsedRate(t *testing.T) {
 	first := Planned{Relative: "Library/A/first.m4a", Size: 100}
 	second := Planned{Relative: "Library/A/second.m4a", Size: 100}
@@ -150,7 +157,8 @@ func TestTransferCopiesPendingFile(t *testing.T) {
 		Relative: relative,
 		Size:     int64(len("song data")),
 	}}
-	if err := transfer(plan, root, false, map[string]string{source: "Playlist"}); err != nil {
+	transfers := makeAudioTransferPlan(plan, root)
+	if err := transfer(transfers, root, false, map[string]string{source: "Playlist"}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(root, relative))
@@ -159,5 +167,101 @@ func TestTransferCopiesPendingFile(t *testing.T) {
 	}
 	if string(data) != "song data" {
 		t.Fatalf("transferred data = %q", data)
+	}
+}
+
+func TestTransferCorrectsSameSizeDifferentFileAndSecondPlanIsEmpty(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync is not installed")
+	}
+	source := filepath.Join(t.TempDir(), "song.m4a")
+	root := t.TempDir()
+	relative := filepath.Join("Library", "Artist", "Album", "song.m4a")
+	destination := filepath.Join(root, relative)
+	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("new-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("old-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sourceTime := time.Unix(1700000000, 0)
+	destinationTime := sourceTime.Add(time.Hour)
+	if err := os.Chtimes(source, sourceTime, sourceTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(destination, destinationTime, destinationTime); err != nil {
+		t.Fatal(err)
+	}
+	plan := []Planned{{
+		Track:    Track{Name: "song", Location: source},
+		Relative: relative,
+		Size:     int64(len("new-data")),
+	}}
+	first := makeAudioTransferPlan(plan, root)
+	if len(first.items) != 1 || first.bytes != int64(len("new-data")) {
+		t.Fatalf("first transfer plan=%#v", first)
+	}
+	if err := transfer(first, root, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(destination); err != nil || string(data) != "new-data" {
+		t.Fatalf("destination=%q, %v", data, err)
+	}
+	second := makeAudioTransferPlan(plan, root)
+	if len(second.items) != 0 || second.bytes != 0 {
+		t.Fatalf("second transfer plan=%#v, want empty", second)
+	}
+}
+
+func TestAudioTransferPlanConvergesOnExFAT(t *testing.T) {
+	root := os.Getenv("MUSIC_BRIDGE_EXFAT_TEST_ROOT")
+	if root == "" {
+		t.Skip("MUSIC_BRIDGE_EXFAT_TEST_ROOT is not set")
+	}
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync is not installed")
+	}
+	target, err := os.MkdirTemp(root, "music-bridge-audio-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(target)
+	source := filepath.Join(t.TempDir(), "song.m4a")
+	relative := filepath.Join("Library", "Artist", "Album", "song.m4a")
+	destination := filepath.Join(target, relative)
+	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("new-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("old-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sourceTime := time.Unix(1700000000, 0)
+	if err := os.Chtimes(source, sourceTime, sourceTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(destination, sourceTime.Add(time.Hour), sourceTime.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	tracks := []Planned{{
+		Track:    Track{Name: "song", Location: source},
+		Relative: relative,
+		Size:     int64(len("new-data")),
+	}}
+	first := makeAudioTransferPlan(tracks, target)
+	if len(first.items) != 1 {
+		t.Fatalf("first exFAT plan=%#v, want one item", first)
+	}
+	if err := transfer(first, target, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	second := makeAudioTransferPlan(tracks, target)
+	if len(second.items) != 0 || second.bytes != 0 {
+		t.Fatalf("second exFAT plan=%#v, want empty", second)
 	}
 }

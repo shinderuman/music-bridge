@@ -79,3 +79,21 @@ func TestMakePlanKeepsArtworkPath(t *testing.T) {
 		t.Fatalf("plan artwork = %#v, missing = %#v", plan, missing)
 	}
 }
+
+func TestValidatePlanRejectsAndroidVisiblePathCollision(t *testing.T) {
+	tests := [][]Planned{
+		{
+			{Track: Track{Location: "/one"}, Relative: `Library/A:B/song.m4a`},
+			{Track: Track{Location: "/two"}, Relative: "Library/A\uf022B/song.m4a"},
+		},
+		{
+			{Track: Track{Location: "/one"}, Relative: `Library/Artist/song.m4a`},
+			{Track: Track{Location: "/two"}, Relative: "Library/ARTIST/song.m4a"},
+		},
+	}
+	for _, plan := range tests {
+		if err := validatePlan(plan, []Playlist{{Tracks: []Track{{Location: "/one"}, {Location: "/two"}}}}); err == nil {
+			t.Fatalf("Android-visible path collision was accepted: %#v", plan)
+		}
+	}
+}

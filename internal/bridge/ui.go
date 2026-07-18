@@ -11,22 +11,43 @@ import (
 	"unicode/utf8"
 )
 
+func chooseSyncMode() (syncMode, error) {
+	items := []string{
+		"ドライブ更新モード（Macに接続したmicroSDXCなど）",
+		"Android更新モード（Wireless debugging）",
+	}
+	index, err := interactiveOne(items, "更新モードを選択してください", func(index int) string {
+		return items[index]
+	})
+	if err != nil {
+		return "", err
+	}
+	if index == 1 {
+		return androidSyncMode, nil
+	}
+	return driveSyncMode, nil
+}
+
 func chooseMany(playlists []Playlist, root string) ([]Playlist, error) {
+	existing := map[string]bool{}
+	if inventory, err := scanPlaylistInventory(root); err == nil {
+		for _, playlist := range playlists {
+			if inventory.contains(playlist.Name) {
+				existing[safeName(playlist.Name)] = true
+			}
+		}
+	}
+	return chooseManyWithExisting(playlists, existing)
+}
+
+func chooseManyWithExisting(playlists []Playlist, existing map[string]bool) ([]Playlist, error) {
 	if len(playlists) == 0 {
 		return nil, fmt.Errorf("プレイリストがありません")
 	}
 	selected := map[int]bool{}
-	seenNames := map[string]bool{}
-	duplicates := map[string]bool{}
-	for _, p := range playlists {
-		name := safeName(p.Name)
-		if seenNames[name] {
-			duplicates[name] = true
-		}
-		seenNames[name] = true
-	}
+	duplicates := duplicatePlaylistNames(playlists)
 	for i, p := range playlists {
-		if _, err := os.Stat(filepath.Join(root, safeName(p.Name)+".m3u")); err == nil {
+		if existing[safeName(p.Name)] {
 			selected[i] = true
 		}
 	}
@@ -53,10 +74,21 @@ func chooseMany(playlists []Playlist, root string) ([]Playlist, error) {
 	}, items)
 }
 
-func chooseTarget(explicit string) (string, error) {
-	if explicit != "" {
-		return explicit, nil
+func duplicatePlaylistNames(playlists []Playlist) map[string]bool {
+	seen := map[string]bool{}
+	duplicates := map[string]bool{}
+	for _, playlist := range playlists {
+		name := safeName(playlist.Name)
+		key := portablePathKey(name)
+		if seen[key] {
+			duplicates[name] = true
+		}
+		seen[key] = true
 	}
+	return duplicates
+}
+
+func chooseTarget() (string, error) {
 	entries, err := os.ReadDir("/Volumes")
 	if err != nil {
 		return "", err

@@ -61,15 +61,14 @@ func retryTransfer(run func() error, sleep func(time.Duration), onRetry func(int
 	}
 }
 
-func transfer(plan []Planned, root string, dry bool, labels map[string]string) error {
+func rsyncEnvironment(base []string) []string {
+	return append(append([]string(nil), base...), "COPYFILE_DISABLE=1")
+}
+
+func transfer(plan audioTransferPlan, root string, dry bool, labels map[string]string) error {
 	started := time.Now()
-	pending := make([]Planned, 0, len(plan))
-	for _, item := range plan {
-		if !sameFile(item.Track.Location, filepath.Join(root, item.Relative)) {
-			pending = append(pending, item)
-		}
-	}
-	total := totalBytes(pending)
+	pending := plan.items
+	total := plan.bytes
 	const maxBatchBytes int64 = 1 << 30
 	batches := make([][]Planned, 0)
 	for _, item := range pending {
@@ -113,7 +112,7 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 		}
 		func() {
 			defer os.RemoveAll(stage)
-			args := []string{"-ahL", "--partial", "--append-verify", "--out-format=%n"}
+			args := []string{"-ahL", "--partial", "--out-format=%n"}
 			if dry {
 				args = append(args, "--dry-run")
 			}
@@ -140,6 +139,7 @@ func transfer(plan []Planned, root string, dry bool, labels map[string]string) e
 				attempt++
 				attemptArgs := append(append([]string(nil), args...), stage+string(os.PathSeparator), root+string(os.PathSeparator))
 				cmd := exec.Command("rsync", attemptArgs...)
+				cmd.Env = rsyncEnvironment(os.Environ())
 				cmd.Stderr = diagnosticWriter()
 				logf("rsync batch %d/%d attempt %d/%d: rsync %s", batchIndex+1, len(batches), attempt, maxTransferRetries+1, strings.Join(attemptArgs, " "))
 				stdout, pipeErr := cmd.StdoutPipe()

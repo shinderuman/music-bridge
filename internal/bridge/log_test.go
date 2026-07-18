@@ -66,6 +66,45 @@ func TestStartDiagnosticLogWritesAndClosesFile(t *testing.T) {
 	}
 }
 
+func TestDiagnosticLogContextRenamesFileAndKeepsWriting(t *testing.T) {
+	closeLog, err := startDiagnosticLogIn(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeLog()
+	original := diagnosticLogPath()
+	if err := setDiagnosticLogContext("android-Pixel 6a-内部ストレージ"); err != nil {
+		t.Fatal(err)
+	}
+	renamed := diagnosticLogPath()
+	if renamed == original {
+		t.Fatal("diagnostic log was not renamed")
+	}
+	if got := filepath.Base(renamed); !strings.HasPrefix(got, "music-bridge-android-Pixel-6a-内部ストレージ-") {
+		t.Fatalf("renamed log=%q", got)
+	}
+	if _, err := os.Stat(original); !os.IsNotExist(err) {
+		t.Fatalf("original log still exists: %v", err)
+	}
+	logf("after rename")
+	if err := diagnosticLog.file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(renamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "after rename") {
+		t.Fatalf("renamed log=%q", data)
+	}
+}
+
+func TestSanitizeLogContext(t *testing.T) {
+	if got := sanitizeLogContext("drive-/Volumes/SDXC 128GB"); got != "drive-Volumes-SDXC-128GB" {
+		t.Fatalf("sanitized context=%q", got)
+	}
+}
+
 func TestRunLogsError(t *testing.T) {
 	previousHome := diagnosticLogHome
 	diagnosticLogHome = func() (string, error) { return t.TempDir(), nil }

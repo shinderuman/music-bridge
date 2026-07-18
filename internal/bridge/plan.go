@@ -21,6 +21,15 @@ func validatePlan(plan []Planned, playlists []Playlist) error {
 	if len(plan) == 0 && countTracks(playlists) > 0 {
 		return fmt.Errorf("同期可能なローカル音源がありません。Musicライブラリの保存先ボリュームが接続されているか確認してください")
 	}
+	physicalPaths := map[string]string{}
+	for _, item := range plan {
+		physical := androidVisiblePath(filepath.ToSlash(item.Relative))
+		key := strings.ToLower(physical)
+		if previous, exists := physicalPaths[key]; exists && previous != item.Track.Location {
+			return fmt.Errorf("Android上で同じパスになる音源があります: %s", physical)
+		}
+		physicalPaths[key] = item.Track.Location
+	}
 	return nil
 }
 
@@ -114,13 +123,19 @@ func sameFile(source, destination string) bool {
 		ai.Size() == bi.Size() && modTimeDelta <= 2*time.Second
 }
 
-func existingBytes(plan []Planned, root string) (int64, error) {
-	var total int64
-	for _, p := range plan {
-		destination := filepath.Join(root, p.Relative)
-		if !sameFile(p.Track.Location, destination) {
-			total += p.Size
+type audioTransferPlan struct {
+	items []Planned
+	bytes int64
+}
+
+func makeAudioTransferPlan(plan []Planned, root string) audioTransferPlan {
+	result := audioTransferPlan{items: make([]Planned, 0, len(plan))}
+	for _, item := range plan {
+		if sameFile(item.Track.Location, filepath.Join(root, item.Relative)) {
+			continue
 		}
+		result.items = append(result.items, item)
+		result.bytes += item.Size
 	}
-	return total, nil
+	return result
 }

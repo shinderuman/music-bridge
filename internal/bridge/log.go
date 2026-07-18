@@ -5,14 +5,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 var diagnosticLog struct {
 	sync.Mutex
-	file *os.File
-	path string
+	file      *os.File
+	path      string
+	dir       string
+	timestamp string
 }
 
 var diagnosticLogHome = os.UserHomeDir
@@ -30,7 +34,8 @@ func startDiagnosticLogIn(home string) (func(), error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, "music-bridge-"+time.Now().Format("20060102-150405")+".log")
+	timestamp := time.Now().Format("20060102-150405")
+	path := filepath.Join(dir, "music-bridge-starting-"+timestamp+".log")
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -38,6 +43,8 @@ func startDiagnosticLogIn(home string) (func(), error) {
 	diagnosticLog.Lock()
 	diagnosticLog.file = file
 	diagnosticLog.path = path
+	diagnosticLog.dir = dir
+	diagnosticLog.timestamp = timestamp
 	diagnosticLog.Unlock()
 	logf("music-bridge started")
 	return func() {
@@ -48,6 +55,47 @@ func startDiagnosticLogIn(home string) (func(), error) {
 			diagnosticLog.file = nil
 		}
 	}, nil
+}
+
+func setDiagnosticLogContext(context string) error {
+	safeContext := sanitizeLogContext(context)
+	if safeContext == "" {
+		return nil
+	}
+	diagnosticLog.Lock()
+	defer diagnosticLog.Unlock()
+	if diagnosticLog.file == nil || diagnosticLog.path == "" {
+		return nil
+	}
+	nextPath := filepath.Join(
+		diagnosticLog.dir,
+		"music-bridge-"+safeContext+"-"+diagnosticLog.timestamp+".log",
+	)
+	if nextPath == diagnosticLog.path {
+		return nil
+	}
+	if err := os.Rename(diagnosticLog.path, nextPath); err != nil {
+		return err
+	}
+	diagnosticLog.path = nextPath
+	return nil
+}
+
+func sanitizeLogContext(value string) string {
+	var result strings.Builder
+	pendingSeparator := false
+	for _, character := range strings.TrimSpace(value) {
+		if unicode.IsLetter(character) || unicode.IsNumber(character) || character == '_' {
+			if pendingSeparator && result.Len() > 0 {
+				result.WriteByte('-')
+			}
+			result.WriteRune(character)
+			pendingSeparator = false
+		} else {
+			pendingSeparator = true
+		}
+	}
+	return strings.Trim(result.String(), "-")
 }
 
 func diagnosticWriter() io.Writer {

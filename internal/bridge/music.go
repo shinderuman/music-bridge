@@ -296,9 +296,10 @@ func savePlaylistCache(path string, cache playlistCache) error {
 type artworkRequest struct {
 	playlistIndex int
 	trackIndex    int
+	albumKey      string
 }
 
-func artworkRequests(playlists []Playlist, plan []Planned, artworkDirs map[string]bool) []artworkRequest {
+func artworkRequests(playlists []Playlist, plan []Planned) []artworkRequest {
 	relativeByLocation := make(map[string]string, len(plan))
 	for _, item := range plan {
 		relativeByLocation[item.Track.Location] = item.Relative
@@ -310,12 +311,13 @@ func artworkRequests(playlists []Playlist, plan []Planned, artworkDirs map[strin
 			if !ok {
 				continue
 			}
-			if !artworkDirs[filepath.Dir(relative)] {
-				continue
-			}
 			// アルバム内の曲ごとにアートワークの有無が異なり得るため、
-			// 未配置アルバムでは全曲を候補にする。既存アルバムは丸ごと省略する。
-			requests = append(requests, artworkRequest{playlistIndex + 1, trackIndex + 1})
+			// 未キャッシュのアルバムでは全曲を候補にする。
+			requests = append(requests, artworkRequest{
+				playlistIndex: playlistIndex + 1,
+				trackIndex:    trackIndex + 1,
+				albumKey:      filepath.ToSlash(filepath.Dir(relative)),
+			})
 		}
 	}
 	return requests
@@ -330,7 +332,8 @@ func artworkCandidateDirs(plan []Planned, root string) map[string]bool {
 			continue
 		}
 		checked[relativeDir] = true
-		if _, err := os.Stat(filepath.Join(root, relativeDir)); err == nil {
+		if info, err := os.Stat(filepath.Join(root, relativeDir, "AlbumArt.jpg")); err == nil &&
+			info.Mode().IsRegular() {
 			continue
 		}
 		candidates[relativeDir] = true
@@ -342,6 +345,28 @@ func exportArtworks(playlists []Playlist, artworkDir string, requests []artworkR
 	if len(requests) == 0 {
 		return nil
 	}
+	cacheRoot, err := artworkCacheLocation()
+	if err != nil {
+		return err
+	}
+	pending, reused := applyCachedArtwork(playlists, requests, cacheRoot)
+	if len(pending) == 0 {
+		fmt.Printf("ジャケ写キャッシュを使用します（%dアルバムを確認済み）\n", reused)
+		return nil
+	}
+	if err := artworkMusicExporter(playlists, artworkDir, pending); err != nil {
+		return err
+	}
+	images, missing, err := persistArtworkResults(playlists, pending, artworkDir, cacheRoot)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ジャケ写キャッシュ: %dアルバム再利用 / %dアルバム追加 / %dアルバムはジャケ写なし\n",
+		reused, images, missing)
+	return nil
+}
+
+func exportArtworksFromMusic(playlists []Playlist, artworkDir string, requests []artworkRequest) error {
 	requestPath := filepath.Join(artworkDir, ".artwork-requests")
 	var requestData strings.Builder
 	for _, request := range requests {
