@@ -8,8 +8,7 @@ import (
 	"time"
 )
 
-func TestArtworkRequestsSkipExistingAlbumArt(t *testing.T) {
-	dir := t.TempDir()
+func TestArtworkRequestsIncludeAllPlannedAlbumsForHostCache(t *testing.T) {
 	playlists := []Playlist{{Name: "P", Tracks: []Track{
 		{Location: "/source/a.m4a"},
 		{Location: "/source/b.m4a"},
@@ -20,20 +19,17 @@ func TestArtworkRequestsSkipExistingAlbumArt(t *testing.T) {
 		{Track: playlists[0].Tracks[1], Relative: "Artist/Existing/b.m4a"},
 		{Track: playlists[0].Tracks[2], Relative: "Artist/New/c.m4a"},
 	}
-	existingArt := filepath.Join(dir, "Artist", "Existing", "AlbumArt.jpg")
-	if err := os.MkdirAll(filepath.Dir(existingArt), 0755); err != nil {
-		t.Fatal(err)
+	want := []artworkRequest{
+		{playlistIndex: 1, trackIndex: 1, albumKey: "Artist/Existing"},
+		{playlistIndex: 1, trackIndex: 2, albumKey: "Artist/Existing"},
+		{playlistIndex: 1, trackIndex: 3, albumKey: "Artist/New"},
 	}
-	if err := os.WriteFile(existingArt, []byte("art"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	want := []artworkRequest{{playlistIndex: 1, trackIndex: 3}}
-	if got := artworkRequests(playlists, plan, artworkCandidateDirs(plan, dir)); !reflect.DeepEqual(got, want) {
+	if got := artworkRequests(playlists, plan); !reflect.DeepEqual(got, want) {
 		t.Fatalf("artworkRequests = %#v, want %#v", got, want)
 	}
 }
 
-func TestArtworkBytesCountsOnlyNewAlbumArt(t *testing.T) {
+func TestArtworkTransferPlanCountsExactlyItsCopies(t *testing.T) {
 	dir := t.TempDir()
 	art := filepath.Join(dir, "art.jpg")
 	if err := os.WriteFile(art, []byte("artwork"), 0644); err != nil {
@@ -44,8 +40,13 @@ func TestArtworkBytesCountsOnlyNewAlbumArt(t *testing.T) {
 		{Track: Track{Artwork: art}, Relative: "Library/A/One/b.m4a"},
 		{Track: Track{Artwork: art}, Relative: "Library/B/Two/c.m4a"},
 	}
-	if got, err := artworkBytes(plan, dir); err != nil || got != 14 {
-		t.Fatalf("artworkBytes = %d, %v; want 14, nil", got, err)
+	candidates := map[string]bool{
+		"Library/A/One": true,
+		"Library/B/Two": true,
+	}
+	transfers, err := makeArtworkTransferPlan(plan, dir, candidates)
+	if err != nil || transfers.bytes != 14 || len(transfers.copies) != 2 {
+		t.Fatalf("artwork plan = %#v, %v; want 14 bytes and 2 copies", transfers, err)
 	}
 	existing := filepath.Join(dir, "Library", "A", "One", "AlbumArt.jpg")
 	if err := os.MkdirAll(filepath.Dir(existing), 0755); err != nil {
@@ -54,12 +55,35 @@ func TestArtworkBytesCountsOnlyNewAlbumArt(t *testing.T) {
 	if err := copyFile(art, existing, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := artworkBytes(plan, dir); err != nil || got != 7 {
-		t.Fatalf("artworkBytes with existing art = %d, %v; want 7, nil", got, err)
+	transfers, err = makeArtworkTransferPlan(plan, dir, candidates)
+	if err != nil || transfers.bytes != 7 || len(transfers.copies) != 1 {
+		t.Fatalf("artwork plan with existing art = %#v, %v; want 7 bytes and 1 copy", transfers, err)
 	}
 }
 
-func TestArtworkCandidateDirsUsesDirectoryExistence(t *testing.T) {
+func TestArtworkTransferPlanDoesNotCountExistingArtWithDifferentTimestamp(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.jpg")
+	destination := filepath.Join(root, "Library/Artist/Album/AlbumArt.jpg")
+	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range map[string]string{source: "new artwork", destination: "old artwork"} {
+		if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan := []Planned{{Track: Track{Artwork: source}, Relative: "Library/Artist/Album/song.m4a"}}
+	transfers, err := makeArtworkTransferPlan(plan, root, map[string]bool{"Library/Artist/Album": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transfers.bytes != 0 || len(transfers.copies) != 0 {
+		t.Fatalf("existing artwork was scheduled: %#v", transfers)
+	}
+}
+
+func TestArtworkCandidateDirsUsesAlbumArtExistence(t *testing.T) {
 	dir := t.TempDir()
 	plan := []Planned{{Relative: "Library/Artist/Album/song.m4a"}}
 	albumDir := filepath.Join(dir, "Library", "Artist", "Album")
@@ -69,8 +93,14 @@ func TestArtworkCandidateDirsUsesDirectoryExistence(t *testing.T) {
 	if err := os.MkdirAll(albumDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	if got := artworkCandidateDirs(plan, dir); len(got) != 1 {
+		t.Fatalf("directory without AlbumArt.jpg should remain a candidate: %#v", got)
+	}
+	if err := os.WriteFile(filepath.Join(albumDir, "AlbumArt.jpg"), []byte("art"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	if got := artworkCandidateDirs(plan, dir); len(got) != 0 {
-		t.Fatalf("existing album directory should be skipped: %#v", got)
+		t.Fatalf("existing AlbumArt.jpg should be skipped: %#v", got)
 	}
 }
 
@@ -78,7 +108,11 @@ func TestWriteArtworksCreatesDirectoryForMissingArtwork(t *testing.T) {
 	dir := t.TempDir()
 	plan := []Planned{{Relative: "Library/Artist/Album/song.m4a"}}
 	artworkDirs := artworkCandidateDirs(plan, dir)
-	if err := writeArtworks(plan, dir, false, artworkDirs); err != nil {
+	transfers, err := makeArtworkTransferPlan(plan, dir, artworkDirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transfers.write(false); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Stat(filepath.Join(dir, "Library", "Artist", "Album")); err != nil || !info.IsDir() {
@@ -98,7 +132,11 @@ func TestWriteArtworksCopiesAlbumArt(t *testing.T) {
 	}
 	plan := []Planned{{Track: Track{Artwork: source}, Relative: "Library/Artist/Album/song.m4a"}}
 	dirs := map[string]bool{"Library/Artist/Album": true}
-	if err := writeArtworks(plan, root, false, dirs); err != nil {
+	transfers, err := makeArtworkTransferPlan(plan, root, dirs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transfers.write(false); err != nil {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(root, "Library/Artist/Album/AlbumArt.jpg")

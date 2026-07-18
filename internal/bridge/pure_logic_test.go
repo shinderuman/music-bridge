@@ -23,8 +23,8 @@ func TestPlanHelpersAndExistingBytes(t *testing.T) {
 	if len(plan) != 1 || !reflect.DeepEqual(missing, []string{"missing"}) || countTracks(playlists) != 3 || totalBytes(plan) != 4 {
 		t.Fatalf("plan=%#v missing=%#v", plan, missing)
 	}
-	if got, err := existingBytes(plan, root); err != nil || got != 4 {
-		t.Fatalf("existingBytes=%d,%v", got, err)
+	if got := makeAudioTransferPlan(plan, root); got.bytes != 4 || len(got.items) != 1 {
+		t.Fatalf("audio transfer plan=%#v", got)
 	}
 	destination := filepath.Join(root, plan[0].Relative)
 	if err := os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
@@ -40,8 +40,8 @@ func TestPlanHelpersAndExistingBytes(t *testing.T) {
 	if err := os.Chtimes(destination, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := existingBytes(plan, root); err != nil || got != 0 {
-		t.Fatalf("existingBytes=%d,%v", got, err)
+	if got := makeAudioTransferPlan(plan, root); got.bytes != 0 || len(got.items) != 0 {
+		t.Fatalf("audio transfer plan with existing file=%#v", got)
 	}
 	if free, err := freeBytes(root); err != nil || free <= 0 {
 		t.Fatalf("freeBytes=%d,%v", free, err)
@@ -75,7 +75,14 @@ func TestPlaylistAndTargetFileHelpers(t *testing.T) {
 	root := t.TempDir()
 	plan := []Planned{{Track: Track{Location: "/source/song.m4a"}, Relative: "Library/A/Album/song.m4a"}}
 	playlists := []Playlist{{Name: "Keep", Tracks: []Track{{Location: "/source/song.m4a"}}}, {Name: "Remove"}}
-	if err := writePlaylists(playlists, plan, root, false); err != nil {
+	playlistPlan, err := makePlaylistSyncPlan(playlists, plan, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := playlistPlan.write(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "DeletedFromMusic.m3u"), []byte("#EXTM3U\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(root, "Keep.m3u"))
@@ -85,8 +92,28 @@ func TestPlaylistAndTargetFileHelpers(t *testing.T) {
 	if got, want := string(data), "\xef\xbb\xbf#EXTM3U\nLibrary/A/Album/song.m4a\n"; got != want {
 		t.Fatalf("playlist=%q", got)
 	}
-	if got := stalePlaylists(playlists, playlists[:1], root); !reflect.DeepEqual(got, []string{filepath.Join(root, "Remove.m3u")}) {
+	playlistPlan, err = makePlaylistSyncPlan(playlists[:1], plan, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := playlistTargetPaths(playlistPlan.stale), []string{
+		filepath.Join(root, "DeletedFromMusic.m3u"),
+		filepath.Join(root, "Remove.m3u"),
+	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("stale=%#v", got)
+	}
+	playlistPlan, err = makePlaylistSyncPlan([]Playlist{{Name: "keep"}}, plan, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := playlistTargetPaths(playlistPlan.stale), []string{
+		filepath.Join(root, "DeletedFromMusic.m3u"),
+		filepath.Join(root, "Remove.m3u"),
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("case-insensitive stale=%#v", got)
+	}
+	if err := playlistPlan.removeStale(false); err != nil {
+		t.Fatal(err)
 	}
 	if got, want := string(prefixLibraryInM3U([]byte("#EXTM3U\r\nA/B.m4a\r\nLibrary/C.m4a\r\n"))), "#EXTM3U\r\nLibrary/A/B.m4a\r\nLibrary/C.m4a\r\n"; got != want {
 		t.Fatalf("prefixed=%q", got)
@@ -94,7 +121,7 @@ func TestPlaylistAndTargetFileHelpers(t *testing.T) {
 	if err := saveManifest(root, []Planned{{Relative: "B"}, {Relative: "A"}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := loadManifest(root); !reflect.DeepEqual(got, []string{"A", "B"}) {
+	if got := loadManifest(root); !reflect.DeepEqual(got, []string{"A", "B", "Keep.m3u"}) {
 		t.Fatalf("manifest=%#v", got)
 	}
 	empty := filepath.Join(root, "empty", "nested")
@@ -161,13 +188,24 @@ func TestMusicInputHelpers(t *testing.T) {
 func TestFilesystemHelpersHandleDryRunAndInvalidManifest(t *testing.T) {
 	root := t.TempDir()
 	plan := []Planned{{Track: Track{Location: "/source/song.m4a"}, Relative: "Library/A/Album/song.m4a"}}
-	if err := writePlaylists([]Playlist{{Name: "P", Tracks: []Track{{Location: "/source/song.m4a"}}}}, plan, root, true); err != nil {
+	playlistPlan, err := makePlaylistSyncPlan(
+		[]Playlist{{Name: "P", Tracks: []Track{{Location: "/source/song.m4a"}}}},
+		plan, root,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := playlistPlan.write(true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "P.m3u")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run wrote playlist: %v", err)
 	}
-	if err := writeArtworks(plan, root, true, map[string]bool{"Library/A/Album": true}); err != nil {
+	artworkPlan, err := makeArtworkTransferPlan(plan, root, map[string]bool{"Library/A/Album": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := artworkPlan.write(true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "Library")); !os.IsNotExist(err) {
@@ -179,6 +217,14 @@ func TestFilesystemHelpersHandleDryRunAndInvalidManifest(t *testing.T) {
 	if got := loadManifest(root); got != nil {
 		t.Fatalf("invalid manifest = %#v, want nil", got)
 	}
+}
+
+func playlistTargetPaths(files []playlistTargetFile) []string {
+	result := make([]string, 0, len(files))
+	for _, file := range files {
+		result = append(result, file.path)
+	}
+	return result
 }
 
 func TestBundledScriptFallsBackToRelativePath(t *testing.T) {

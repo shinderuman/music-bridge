@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ const dataDir = "music-bridge"
 const libraryDir = "Library"
 const marker = ".music-bridge-target"
 const manifest = ".music-bridge-manifest.json"
+const pendingManifest = ".music-bridge-pending-manifest"
 const completionSound = "/System/Library/Sounds/Glass.aiff"
 
 type Planned struct {
@@ -20,12 +22,22 @@ type Planned struct {
 	Size     int64
 }
 
+type syncMode string
+
+const (
+	driveSyncMode   syncMode = "drive"
+	androidSyncMode syncMode = "android"
+)
+
 func Run(argv []string) error {
 	closeLog, logErr := startDiagnosticLog()
 	if logErr == nil {
 		defer closeLog()
 	}
 	err := runSync(argv)
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
 	if err != nil {
 		logf("error: %v", err)
 	}
@@ -42,7 +54,6 @@ func NotifyCompletion() {
 
 func runSync(argv []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
-	target := fs.String("target", "", "target volume")
 	initTarget := fs.Bool("init-target", false, "initialize target")
 	dryRun := fs.Bool("dry-run", false, "dry run")
 	refresh := fs.Bool("refresh", false, "refresh playlist cache from Music.app")
@@ -53,9 +64,22 @@ func runSync(argv []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("サブコマンドは廃止されました。music-bridge [options] で実行してください")
 	}
-	volume, err := chooseTarget(*target)
+	mode, err := chooseSyncMode()
 	if err != nil {
 		return err
+	}
+	if mode == androidSyncMode {
+		return runAndroidSync(androidSyncOptions{
+			InitTarget: *initTarget,
+			DryRun:     *dryRun, Refresh: *refresh, Source: *source,
+		})
+	}
+	volume, err := chooseTarget()
+	if err != nil {
+		return err
+	}
+	if err := setDiagnosticLogContext("drive-" + filepath.Base(volume)); err != nil {
+		logf("diagnostic log rename failed: %v", err)
 	}
 	root := filepath.Join(volume, dataDir)
 	markerPath := filepath.Join(root, marker)
@@ -112,10 +136,7 @@ func runSync(argv []string) error {
 		// 配置されず、次回も同じ問い合わせを繰り返す。まず音源だけで収まる
 		// 範囲を仮決定し、その範囲のアルバムだけをMusic.appへ問い合わせる。
 		artworkPlan := plan
-		audioWithoutArtwork, err := existingBytes(plan, root)
-		if err != nil {
-			return err
-		}
+		audioWithoutArtwork := makeAudioTransferPlan(plan, root).bytes
 		freeBeforeArtwork, err := freeBytes(volume)
 		if err != nil {
 			return err
@@ -124,7 +145,7 @@ func runSync(argv []string) error {
 			artworkPlan = fitPlan(plan, root, freeBeforeArtwork)
 		}
 		artworkDirs = artworkCandidateDirs(artworkPlan, root)
-		if err := exportArtworks(playlists, artworkDir, artworkRequests(playlists, artworkPlan, artworkDirs)); err != nil {
+		if err := exportArtworks(playlists, artworkDir, artworkRequests(playlists, artworkPlan)); err != nil {
 			return err
 		}
 		// exportArtworks は playlists 内の Track.Artwork を更新する。転送計画は
@@ -139,14 +160,13 @@ func runSync(argv []string) error {
 		fmt.Printf("ローカルファイルなし: %d曲\n", len(missing))
 	}
 	cleanupPlan := append([]Planned(nil), plan...)
-	audioRequired, err := existingBytes(plan, root)
+	audioTransfers := makeAudioTransferPlan(plan, root)
+	artworkTransfers, err := makeArtworkTransferPlan(plan, root, artworkDirs)
 	if err != nil {
 		return err
 	}
-	artworkRequired, err := artworkBytes(plan, root)
-	if err != nil {
-		return err
-	}
+	audioRequired := audioTransfers.bytes
+	artworkRequired := artworkTransfers.bytes
 	required := audioRequired + artworkRequired
 	free, err := freeBytes(volume)
 	if err != nil {
@@ -164,14 +184,36 @@ func runSync(argv []string) error {
 			artworkBudget = 0
 		}
 		plan = fitPlan(plan, root, artworkBudget)
+		audioTransfers = makeAudioTransferPlan(plan, root)
+		artworkTransfers, err = makeArtworkTransferPlan(plan, root, artworkDirs)
+		if err != nil {
+			return err
+		}
 	}
-	stale := stalePlaylists(summaries, selected, root)
-	if len(stale) > 0 {
-		fmt.Printf("警告: 選択されなかったプレイリストのM3Uを削除します（%d件）\n", len(stale))
+	playlistTransfers, err := makePlaylistSyncPlan(playlists, plan, root)
+	if err != nil {
+		return err
+	}
+	if len(playlistTransfers.stale) > 0 {
+		fmt.Printf("警告: 選択されなかったプレイリストのM3Uを削除します（%d件）\n", len(playlistTransfers.stale))
 	}
 	toDelete, deleteBytes := staleAudio(cleanupPlan, root)
 	if len(toDelete) > 0 {
 		fmt.Printf("警告: 選択されなかった音源を削除します（%dファイル / %s）\n", len(toDelete), humanBytes(deleteBytes))
+	}
+	artworkToDelete, artworkDeleteBytes, err := staleArtwork(cleanupPlan, root)
+	if err != nil {
+		return err
+	}
+	if len(artworkToDelete) > 0 {
+		fmt.Printf("警告: 選択されなかったアルバムのジャケ写を削除します（%dファイル / %s）\n",
+			len(artworkToDelete), humanBytes(artworkDeleteBytes))
+	}
+	managementToDelete := staleManagementFiles(root)
+	if !*dryRun {
+		if err := savePendingManifest(root, plan); err != nil {
+			return err
+		}
 	}
 	labels := map[string]string{}
 	for _, p := range playlists {
@@ -181,22 +223,30 @@ func runSync(argv []string) error {
 			}
 		}
 	}
-	if err := writePlaylists(playlists, plan, root, *dryRun); err != nil {
+	if err := playlistTransfers.write(*dryRun); err != nil {
 		return err
 	}
-	if err := writeArtworks(plan, root, *dryRun, artworkDirs); err != nil {
+	if err := artworkTransfers.write(*dryRun); err != nil {
 		return err
 	}
-	if err := transfer(plan, root, *dryRun, labels); err != nil {
+	if err := transfer(audioTransfers, root, *dryRun, labels); err != nil {
 		return err
 	}
 	if !*dryRun {
-		for _, path := range stale {
-			if err := os.Remove(path); err != nil {
+		if err := playlistTransfers.removeStale(false); err != nil {
+			return err
+		}
+		for _, path := range toDelete {
+			if err := os.Remove(filepath.Join(root, path)); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 		}
-		for _, path := range toDelete {
+		for _, path := range artworkToDelete {
+			if err := os.Remove(filepath.Join(root, path)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		for _, path := range managementToDelete {
 			if err := os.Remove(filepath.Join(root, path)); err != nil && !os.IsNotExist(err) {
 				return err
 			}

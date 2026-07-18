@@ -2,7 +2,7 @@
 
 **MacのMusic.appで作ったプレイリストを、Androidでそのまま再生できる形にするCLIツールです。**
 
-Music.appのローカル音源と選択したプレイリストから、Android向けの音源ファイル・相対パスM3Uプレイリスト・アルバムアートをひとつのディレクトリへ生成します。microSDXCを主な同期先として想定しています。
+Music.appのローカル音源と選択したプレイリストから、Android向けの音源ファイル・相対パスM3Uプレイリスト・アルバムアートをひとつのディレクトリへ生成します。Macへ接続したmicroSDXCのほか、Wireless debuggingで接続したAndroidへ直接同期できます。
 
 ```text
 Music.appのプレイリスト
@@ -26,13 +26,17 @@ Androidで再生できる音源 + M3U + AlbumArt
   - 音源・プレイリスト・アルバムアートを `music-bridge` ディレクトリだけにまとめます。
 - **選択内容に合わせて同期先を整理**
   - 選択から外したプレイリストと、参照されなくなった管理対象の音源を取り除きます。
+- **AndroidへWi-Fiで直接同期**
+  - 内部ストレージ、SDカード、USB OTGストレージから同期先を選択できます。
+  - Wi-Fiが切れても再接続を待ち、転送済みの位置から再開します。
 
 ## 要件
 
 - macOS
 - Music.app（同期したい曲がローカルに保存されていること）
 - Go 1.22以降
-- Android端末またはmicroSDXCをMacへマウントできること
+- ドライブ更新モードを使う場合は、microSDXCなどMacへマウントできる同期先
+- Android直接同期を使う場合はADB（Android Debug Bridge）
 
 初回実行時には、ターミナルからMusic.appを操作するためのAutomation許可をmacOSが求めます。許可してください。
 
@@ -48,16 +52,43 @@ go run ./cmd/music-bridge
 初めて使うストレージでは、専用ディレクトリを初期化します。
 
 ```bash
-go run ./cmd/music-bridge --target /Volumes/MUSIC_SD --init-target
+go run ./cmd/music-bridge --init-target
 ```
 
 実際にはコピー・削除せず、同期内容を確認するには `--dry-run` を使います。
 
 ```bash
-go run ./cmd/music-bridge --target /Volumes/MUSIC_SD --dry-run
+go run ./cmd/music-bridge --dry-run
 ```
 
+### AndroidへWi-Fiで直接同期
+
+MacへADBを導入します。
+
+```bash
+brew install android-platform-tools
+```
+
+Androidの開発者向けオプションでWireless debuggingを有効にし、画面に表示されるアドレスとコードを使って初回だけペアリング・接続します。
+
+```bash
+adb pair IP_ADDRESS:PAIRING_PORT
+adb connect IP_ADDRESS:DEBUG_PORT
+```
+
+接続後は`music-bridge`を実行し、最初の画面で「Android更新モード」を選択します。接続済み端末が複数ある場合は端末を選択し、続いて内部ストレージ・SDカード・USB OTGストレージから同期先を選択します。Android端末をMacへUSB接続して同期する機能ではありません。
+
+Macへ直接接続して同期済みのmicroSDXCをAndroidへ戻した後も、同じ音源を再転送せずにAndroid直接同期へ切り替えられます。macOSとAndroidで見え方が異なるFAT/exFATの予約文字や大文字・小文字はMusic Bridgeが同一パスとして扱います。
+
+```bash
+music-bridge
+```
+
+転送中に画面が消えたりWi-Fi接続が切れたりした場合は、まず1分間、自動で再接続を試します。1分経っても戻らなければ通知音を鳴らして再接続を案内し、Yならもう1分待機、nなら同期を中断します。端末の再起動などでADBの接続先IDが変わっても、同じ端末を再検出します。接続が戻るとAndroid上の部分ファイルを確認し、未転送位置から再開します。
+
 初回の同期では選択したプレイリストの曲情報をMusic.appから取得し、Macのキャッシュへ保存します。以後は、Music.appから曲ID一覧だけを読み取ってキャッシュと照合し、曲の追加・削除・入れ替え・並び順が変わったプレイリストだけ詳細情報を再取得します。詳細情報はプレイリストごとにキャッシュへ保存するため、途中で同期が中断しても、取得済みプレイリストのキャッシュは次回利用できます。
+
+ジャケ写もアルバム単位でMacへキャッシュします。ジャケ写がないアルバムも確認済みとして記録するため、Androidとの接続断や転送失敗後に同じジャケ写をMusic.appから取得し直しません。キャッシュは同期先ごとに分かれず、Macへ接続したドライブとAndroid直接同期の両方で共用します。
 
 曲名・アーティスト名・アルバム名などのタグ変更を反映したい場合は、`--refresh` で選択したプレイリストの詳細情報をすべて更新してください。
 
@@ -90,24 +121,33 @@ music-bridge
 
 ```mermaid
 flowchart TD
-    start["music-bridge"] --> target["同期先ボリュームを選択"]
+    start["music-bridge"] --> mode{"更新モードを選択"}
+    mode --> drive["ドライブ更新モード"]
+    drive --> target["同期先ボリュームを選択"]
+    mode --> android["Android: Wireless debugging端末と\nAndroid内ストレージを選択"]
     target --> marker{"同期先のマーカーを確認\n(microSDXC: 読み取り)"}
+    android --> androidMarker{"Android上のmusic-bridgeを確認\n(ADB over Wi-Fi)"}
     marker -->|初回のみ| initialize["music-bridgeディレクトリを初期化\n(microSDXC: 書き込み)"]
+    androidMarker -->|初回のみ| androidInitialize["Android上のmusic-bridgeを初期化\n(ADB over Wi-Fi)"]
     marker --> summary["Music.appからプレイリスト一覧を取得"]
     initialize --> summary
-    summary --> choose["プレイリストを選択\n(microSDXC: 既存M3Uを読み取り)"]
+    androidMarker --> summary
+    androidInitialize --> summary
+    summary --> choose["プレイリストを選択\n(同期先: 既存M3Uを読み取り)"]
     choose --> fingerprint["Music.appの曲ID一覧と\nホスト側キャッシュを照合"]
     fingerprint -->|変更あり| metadata["変更されたプレイリストだけ\n曲情報を取得してキャッシュ更新"]
     fingerprint -->|変更なし| cached["ホスト側の曲情報キャッシュを使用"]
     metadata --> plan["Mac上の元音源を走査し\n同期計画を作成"]
     cached --> plan
-    plan --> artcheck{"AlbumArt.jpgを確認\n(microSDXC: 読み取り)"}
-    artcheck -->|未配置のアルバムのみ| artwork["Music.appからジャケ写を取得<br/>Macの一時領域へ保存"]
-    artcheck --> capacity["既存音源・M3U・マニフェスト・空き容量を確認<br/>音源とジャケ写の必要容量を計算<br/>(microSDXC: 読み取り)"]
-    artwork --> capacity
-    capacity --> prepare["M3UとAlbumArtを先に配置<br/>(microSDXC: 書き込み)"]
-    prepare --> transfer["Macの元音源をコピー<br/>→ microSDXCへ書き込み"]
-    transfer --> finalize["マニフェストを書き出し<br/>不要ファイルを削除<br/>(microSDXC: 読み取り・書き込み)"]
+    plan --> artcache{"ホスト側のジャケ写キャッシュを確認"}
+    artcache -->|未キャッシュのアルバムのみ| artwork["Music.appからジャケ写を取得"]
+    artwork --> saveart["画像または「ジャケ写なし」を\nホスト側キャッシュへ保存"]
+    artcache -->|確認済み| artcheck{"AlbumArt.jpgを確認\n(同期先: 読み取り)"}
+    saveart --> artcheck
+    artcheck --> capacity["既存音源・M3U・マニフェスト・空き容量を確認<br/>音源とジャケ写の必要容量を計算<br/>(同期先: 読み取り)"]
+    capacity --> prepare["M3UとAlbumArtを先に配置<br/>(同期先へ書き込み)"]
+    prepare --> transfer["Macの元音源をコピー<br/>→ microSDXCまたはAndroid"]
+    transfer --> finalize["マニフェストを書き出し<br/>不要ファイルを削除<br/>(同期先: 読み取り・書き込み)"]
     finalize --> done["同期完了"]
 ```
 
@@ -130,11 +170,13 @@ music-bridge/
 ## 同期の扱い
 
 - 既に同じ音源があれば再転送しません。
-- 新規の音源とジャケ写を合算して必要容量を確認します。
+- 新規の音源・ジャケ写・プレイリストを合算して必要容量を確認します。
 - 選択済みのM3Uと `AlbumArt.jpg` は、音源転送より先に配置します。
 - 選択しなかったプレイリストのM3Uは削除します。
 - どの選択済みプレイリストからも参照されない、Music Bridge管理下の音源は削除します。
 - 容量不足時は警告を表示し、空き容量に収まる範囲で同期します。
+- Android直接同期では、端末・ストレージの組み合わせごとに同時実行を防ぎます。別ストレージへの同期は同時に実行できます。
+- Android直接同期の部分ファイルには転送元のサイズと更新日時を記録し、異なる内容の部分ファイルを誤って再利用しません。
 
 `music-bridge` ディレクトリはMusic Bridge専用として扱ってください。手動でファイルを置く用途には向きません。
 
@@ -143,7 +185,8 @@ music-bridge/
 - 同名のプレイリストには対応していません。検出時は警告を表示します。
 - Music.app上でローカルファイルの場所を取得できない曲は同期できません。
 - 大規模ライブラリでは、Music.appからの曲情報・ジャケ写取得に時間がかかる場合があります。
-- コンテンツの転送が始まるまではMusic.appを終了しないでください。`コピー中` と表示された後はMusic.appを終了しても同期に影響しません。
+- コンテンツの転送が始まるまではMusic.appを終了しないでください。音源・ジャケ写・プレイリストの転送進捗が表示された後は、Music.appを終了しても同期に影響しません。
+- Android直接同期を始める前に、MacとAndroidが同じネットワーク上でADB接続済みであることを確認してください。
 
 ## License
 

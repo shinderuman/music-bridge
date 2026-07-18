@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 )
 
 const syncLock = ".music-bridge-sync.lock"
+const libraryManifestMarker = ".music-bridge-library-indexed"
+const legacyArtworkManifestMarker = ".music-bridge-artwork-indexed"
+const albumArtworkFile = "AlbumArt.jpg"
 
 func loadManifest(root string) []string {
 	data, err := os.ReadFile(filepath.Join(root, manifest))
@@ -45,13 +49,41 @@ func lockTarget(root string) (func(), error) {
 
 func staleAudio(plan []Planned, root string) ([]string, int64) {
 	desired := map[string]bool{}
+	desiredManaged := map[string]bool{}
 	for _, item := range plan {
-		desired[item.Relative] = true
+		desired[portablePathKey(filepath.ToSlash(item.Relative))] = true
+		desiredManaged[portablePathKey(filepath.ToSlash(item.Relative))] = true
+		desiredManaged[portablePathKey(filepath.ToSlash(
+			filepath.Join(filepath.Dir(item.Relative), albumArtworkFile),
+		))] = true
+	}
+	candidates := loadManagedPaths(root)
+	candidates = append(candidates, localTransferPartials(root, candidates)...)
+	if _, err := os.Stat(filepath.Join(root, libraryManifestMarker)); os.IsNotExist(err) {
+		if legacy, scanErr := legacyLibraryFiles(root, false); scanErr == nil {
+			candidates = append(candidates, legacy...)
+		}
 	}
 	var stale []string
 	var total int64
-	for _, relative := range loadManifest(root) {
-		if desired[relative] {
+	for _, relative := range uniqueSortedPaths(candidates) {
+		if !strings.HasPrefix(filepath.ToSlash(relative), libraryDir+"/") {
+			continue
+		}
+		if isAppleDoublePath(relative) {
+			continue
+		}
+		if filepath.Base(relative) == albumArtworkFile {
+			continue
+		}
+		if destination, partial := transferPartialDestination(relative); partial {
+			if desiredManaged[portablePathKey(filepath.ToSlash(destination))] {
+				if _, err := os.Stat(filepath.Join(root, destination)); os.IsNotExist(err) {
+					continue
+				}
+			}
+		}
+		if desired[portablePathKey(filepath.ToSlash(relative))] {
 			continue
 		}
 		info, err := os.Stat(filepath.Join(root, relative))
@@ -64,13 +96,222 @@ func staleAudio(plan []Planned, root string) ([]string, int64) {
 	return stale, total
 }
 
-func saveManifest(root string, plan []Planned) error {
-	paths := make([]string, 0, len(plan))
+func staleManagementFiles(root string) []string {
+	candidates := []string{
+		legacyArtworkManifestMarker,
+		manifest + ".tmp",
+		pendingManifest + ".tmp",
+		libraryManifestMarker + ".tmp",
+	}
+	var stale []string
+	for _, relative := range candidates {
+		if info, err := os.Stat(filepath.Join(root, relative)); err == nil && info.Mode().IsRegular() {
+			stale = append(stale, relative)
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
+func localTransferPartials(root string, managed []string) []string {
+	var result []string
+	for _, relative := range managed {
+		if !strings.HasPrefix(filepath.ToSlash(relative), libraryDir+"/") {
+			continue
+		}
+		for _, suffix := range []string{
+			androidPartialSuffix,
+			androidPartialSuffix + androidPartialMetaSuffix,
+		} {
+			partial := relative + suffix
+			if info, err := os.Stat(filepath.Join(root, partial)); err == nil && info.Mode().IsRegular() {
+				result = append(result, partial)
+			}
+		}
+	}
+	return uniqueSortedPaths(result)
+}
+
+func transferPartialDestination(relative string) (string, bool) {
+	withoutMeta := strings.TrimSuffix(relative, androidPartialMetaSuffix)
+	if !strings.HasSuffix(withoutMeta, androidPartialSuffix) {
+		return "", false
+	}
+	return strings.TrimSuffix(withoutMeta, androidPartialSuffix), true
+}
+
+func staleArtwork(plan []Planned, root string) ([]string, int64, error) {
+	desired := map[string]bool{}
+	for _, item := range plan {
+		relative := filepath.Join(filepath.Dir(item.Relative), albumArtworkFile)
+		desired[portablePathKey(filepath.ToSlash(relative))] = true
+	}
+	var candidates []string
+	if _, err := os.Stat(filepath.Join(root, libraryManifestMarker)); err == nil {
+		for _, relative := range loadManagedPaths(root) {
+			if filepath.Base(relative) == albumArtworkFile {
+				candidates = append(candidates, relative)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, 0, err
+	} else {
+		var err error
+		candidates, err = legacyLibraryFiles(root, true)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	var stale []string
+	var total int64
+	for _, relative := range candidates {
+		if desired[portablePathKey(filepath.ToSlash(relative))] {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(root, relative))
+		if err == nil && info.Mode().IsRegular() {
+			stale = append(stale, relative)
+			total += info.Size()
+		}
+	}
+	sort.Strings(stale)
+	return stale, total, nil
+}
+
+func legacyLibraryFiles(root string, artwork bool) ([]string, error) {
+	libraryRoot := filepath.Join(root, libraryDir)
+	var result []string
+	err := filepath.WalkDir(libraryRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() || (entry.Name() == albumArtworkFile) != artwork {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		result = append(result, relative)
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func loadManagedPaths(root string) []string {
+	result := make([]string, 0)
+	for _, relative := range loadManifest(root) {
+		result = append(result, localManagedPath(relative))
+	}
+	data, err := os.ReadFile(filepath.Join(root, pendingManifest))
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if relative := strings.TrimSpace(line); relative != "" {
+				result = append(result, localManagedPath(relative))
+			}
+		}
+	}
+	return uniqueSortedPaths(result)
+}
+
+func localManagedPath(relative string) string {
+	logical := logicalPathFromAndroid(filepath.ToSlash(relative))
+	return filepath.FromSlash(logical)
+}
+
+func uniqueSortedPaths(paths []string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path != "" && !seen[path] {
+			seen[path] = true
+			result = append(result, path)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func savePendingManifest(root string, plan []Planned) error {
+	paths := loadManagedPaths(root)
 	for _, item := range plan {
 		paths = append(paths, item.Relative)
+		if item.Track.Artwork != "" {
+			paths = append(paths, filepath.Join(filepath.Dir(item.Relative), albumArtworkFile))
+		}
+	}
+	for index := range paths {
+		paths[index] = androidVisiblePath(filepath.ToSlash(paths[index]))
+	}
+	paths = uniqueSortedPaths(paths)
+	var data strings.Builder
+	for _, relative := range paths {
+		data.WriteString(relative)
+		data.WriteByte('\n')
+	}
+	return writeFileAtomically(filepath.Join(root, pendingManifest), []byte(data.String()), 0644)
+}
+
+func saveManifest(root string, plan []Planned) error {
+	paths := make([]string, 0, len(plan)*2)
+	seen := map[string]bool{}
+	for _, item := range plan {
+		relative := androidVisiblePath(filepath.ToSlash(item.Relative))
+		if !seen[relative] {
+			paths = append(paths, relative)
+			seen[relative] = true
+		}
+		artwork := androidVisiblePath(filepath.ToSlash(
+			filepath.Join(filepath.Dir(item.Relative), albumArtworkFile),
+		))
+		if seen[artwork] {
+			continue
+		}
+		logicalArtwork := filepath.Join(filepath.Dir(item.Relative), albumArtworkFile)
+		if info, err := os.Stat(filepath.Join(root, logicalArtwork)); err == nil && info.Mode().IsRegular() {
+			paths = append(paths, artwork)
+			seen[artwork] = true
+		}
+	}
+	if entries, err := os.ReadDir(root); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || isAppleDoublePath(entry.Name()) || filepath.Ext(entry.Name()) != ".m3u" {
+				continue
+			}
+			relative := androidVisiblePath(entry.Name())
+			if seen[relative] {
+				continue
+			}
+			paths = append(paths, relative)
+			seen[relative] = true
+		}
 	}
 	sort.Strings(paths)
-	return saveManifestPaths(root, paths)
+	if err := saveManifestPaths(root, paths); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(root, libraryManifestMarker)); os.IsNotExist(err) {
+		if err := writeFileAtomically(
+			filepath.Join(root, libraryManifestMarker),
+			[]byte("Library paths are indexed in the manifest.\n"),
+			0644,
+		); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(root, pendingManifest)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func saveManifestPaths(root string, paths []string) error {
@@ -78,7 +319,24 @@ func saveManifestPaths(root string, paths []string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(root, manifest), append(data, '\n'), 0644)
+	destination := filepath.Join(root, manifest)
+	data = append(data, '\n')
+	if current, err := os.ReadFile(destination); err == nil && bytes.Equal(current, data) {
+		return nil
+	}
+	return writeFileAtomically(destination, data, 0644)
+}
+
+func writeFileAtomically(path string, data []byte, mode os.FileMode) error {
+	temp := path + ".tmp"
+	if err := os.WriteFile(temp, data, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(temp, path); err != nil {
+		_ = os.Remove(temp)
+		return err
+	}
+	return nil
 }
 
 func migrateLegacyLayout(root string) error {
@@ -122,7 +380,9 @@ func migrateLegacyLayout(root string) error {
 
 	manifestPaths := loadManifest(root)
 	for i, path := range manifestPaths {
-		if !strings.HasPrefix(filepath.ToSlash(path), libraryDir+"/") {
+		slashed := filepath.ToSlash(path)
+		if !strings.HasPrefix(slashed, libraryDir+"/") &&
+			!(filepath.Ext(path) == ".m3u" && !strings.Contains(slashed, "/")) {
 			manifestPaths[i] = filepath.Join(libraryDir, path)
 		}
 	}

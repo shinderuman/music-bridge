@@ -9,82 +9,86 @@ import (
 	"time"
 )
 
-func artworkBytes(plan []Planned, root string) (int64, error) {
-	seen := map[string]bool{}
-	var total int64
-	for _, item := range plan {
-		if item.Track.Artwork == "" {
-			continue
-		}
-		destinationDir := filepath.Join(root, filepath.Dir(item.Relative))
-		if seen[destinationDir] {
-			continue
-		}
-		sourceInfo, err := os.Stat(item.Track.Artwork)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return 0, err
-		}
-		if !sourceInfo.Mode().IsRegular() || sameFile(item.Track.Artwork, filepath.Join(destinationDir, "AlbumArt.jpg")) {
-			if sourceInfo.Mode().IsRegular() {
-				seen[destinationDir] = true
-			}
-			continue
-		}
-		seen[destinationDir] = true
-		total += sourceInfo.Size()
-	}
-	return total, nil
+type artworkCopy struct {
+	source      string
+	destination string
+	modTime     time.Time
 }
 
-func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string]bool) error {
-	started := time.Now()
-	type artworkCopy struct {
-		source      string
-		destination string
-		modTime     time.Time
-	}
-	plannedDirs := map[string]string{}
+type artworkTransferPlan struct {
+	available int
+	bytes     int64
+	copies    []artworkCopy
+	emptyDirs []string
+}
+
+func makeArtworkTransferPlan(tracks []Planned, root string, candidateDirs map[string]bool) (artworkTransferPlan, error) {
+	result := artworkTransferPlan{}
+	plannedDirs := map[string]bool{}
 	sources := map[string]string{}
-	for _, item := range plan {
+	for _, item := range tracks {
 		relativeDir := filepath.Dir(item.Relative)
+		if !candidateDirs[relativeDir] {
+			continue
+		}
 		destinationDir := filepath.Join(root, relativeDir)
-		plannedDirs[destinationDir] = relativeDir
+		plannedDirs[destinationDir] = true
 		if item.Track.Artwork == "" || sources[destinationDir] != "" {
 			continue
 		}
 		info, err := os.Stat(item.Track.Artwork)
-		if err == nil && info.Mode().IsRegular() {
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return artworkTransferPlan{}, err
+		}
+		if info.Mode().IsRegular() {
 			sources[destinationDir] = item.Track.Artwork
 		}
 	}
-	available := 0
-	var copies []artworkCopy
-	var emptyArtworkDirs []string
-	for destinationDir, relativeDir := range plannedDirs {
-		if !artworkDirs[relativeDir] {
+	for destinationDir := range plannedDirs {
+		destination := filepath.Join(destinationDir, albumArtworkFile)
+		if info, err := os.Stat(destination); err == nil && info.Mode().IsRegular() {
+			// 一度配置済みのアルバムは更新しない。容量表示と配置処理の両方で
+			// 同じ判定を使うため、既存画像を再転送分として数えない。
 			continue
+		} else if err != nil && !os.IsNotExist(err) {
+			return artworkTransferPlan{}, err
 		}
-		destination := filepath.Join(destinationDir, "AlbumArt.jpg")
 		source := sources[destinationDir]
 		if source == "" {
-			emptyArtworkDirs = append(emptyArtworkDirs, destinationDir)
+			result.emptyDirs = append(result.emptyDirs, destinationDir)
 			continue
 		}
 		sourceInfo, err := os.Stat(source)
-		if err != nil || !sourceInfo.Mode().IsRegular() {
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return artworkTransferPlan{}, err
+		}
+		if !sourceInfo.Mode().IsRegular() {
 			continue
 		}
-		available++
-		if sameFile(source, destination) {
-			continue
-		}
-		copies = append(copies, artworkCopy{source, destination, sourceInfo.ModTime()})
+		result.available++
+		result.bytes += sourceInfo.Size()
+		result.copies = append(result.copies, artworkCopy{
+			source:      source,
+			destination: destination,
+			modTime:     sourceInfo.ModTime(),
+		})
 	}
-	sort.Slice(copies, func(i, j int) bool { return copies[i].destination < copies[j].destination })
-	for _, destinationDir := range emptyArtworkDirs {
+	sort.Slice(result.copies, func(i, j int) bool {
+		return result.copies[i].destination < result.copies[j].destination
+	})
+	sort.Strings(result.emptyDirs)
+	return result, nil
+}
+
+func (plan artworkTransferPlan) write(dry bool) error {
+	started := time.Now()
+	for _, destinationDir := range plan.emptyDirs {
 		if dry {
 			continue
 		}
@@ -92,15 +96,15 @@ func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string
 			return err
 		}
 	}
-	if len(copies) > 0 && !dry {
+	if len(plan.copies) > 0 && !dry {
 		lastDraw := time.Time{}
 		drawProgress := func(done int) {
-			percent := float64(done) * 100 / float64(len(copies))
-			fmt.Printf("\033[2K\rジャケ写を配置中 [%d/%d] %5.1f%%", done, len(copies), percent)
+			percent := float64(done) * 100 / float64(len(plan.copies))
+			fmt.Printf("\033[2K\rジャケ写を配置中 [%d/%d] %5.1f%%", done, len(plan.copies), percent)
 			lastDraw = time.Now()
 		}
 		drawProgress(0)
-		for index, copy := range copies {
+		for index, copy := range plan.copies {
 			if err := os.MkdirAll(filepath.Dir(copy.destination), 0755); err != nil {
 				fmt.Print("\033[2K\r")
 				return err
@@ -110,13 +114,14 @@ func writeArtworks(plan []Planned, root string, dry bool, artworkDirs map[string
 				return err
 			}
 			done := index + 1
-			if done == len(copies) || done%10 == 0 || time.Since(lastDraw) >= time.Second {
+			if done == len(plan.copies) || done%10 == 0 || time.Since(lastDraw) >= time.Second {
 				drawProgress(done)
 			}
 		}
 		fmt.Print("\033[2K\r\n")
 	}
-	fmt.Printf("ジャケ写: %d件取得 / %d件配置（処理時間: %s）\n", available, len(copies), time.Since(started).Round(time.Millisecond))
+	fmt.Printf("ジャケ写: %d件取得 / %d件配置（処理時間: %s）\n",
+		plan.available, len(plan.copies), time.Since(started).Round(time.Millisecond))
 	return nil
 }
 
