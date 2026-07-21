@@ -4,17 +4,17 @@ import (
 	"fmt"
 	"os"
 
-	"music-bridge/internal/bridge"
+	"music-bridge/internal/app"
 )
 
 func main() {
-	if err := bridge.Run(os.Args[1:]); err != nil {
+	if err := app.Run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "music-bridge:", err)
-		if logPath := bridge.DiagnosticLogPath(); logPath != "" {
+		if logPath := app.DiagnosticLogPath(); logPath != "" {
 			fmt.Fprintln(os.Stderr, "music-bridge: 詳細ログ:", logPath)
 		}
-		bridge.NotifyCompletion()
+		app.NotifyCompletion()
 		os.Exit(1)
 	}
-	bridge.NotifyCompletion()
+	app.NotifyCompletion()
 }

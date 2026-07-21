@@ -3,7 +3,7 @@ LIBDIR := $(PREFIX)/lib/music-bridge
 BINDIR := $(PREFIX)/bin
 DISTDIR := dist/music-bridge
 
-.PHONY: all build install uninstall clean
+.PHONY: all build install test uninstall clean
 
 all: install
 
@@ -18,6 +18,9 @@ install: build
 	rm -rf "$(LIBDIR)"
 	cp -R "$(DISTDIR)" "$(LIBDIR)"
 	ln -sfn "../lib/music-bridge/music-bridge" "$(BINDIR)/music-bridge"
+
+test:
+	./tools/test.sh
 
 uninstall:
 	rm -f "$(BINDIR)/music-bridge"
