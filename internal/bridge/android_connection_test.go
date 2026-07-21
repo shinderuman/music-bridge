@@ -8,39 +8,39 @@ import (
 	"time"
 )
 
-func useFastAndroidReconnect(t *testing.T, promptAfter time.Duration) {
+func useFastAndroidReconnect(t *testing.T, firstNoticeAfter, noticeInterval time.Duration) {
 	t.Helper()
-	previousPromptAfter := androidReconnectPromptAfter
+	previousFirstNoticeAfter := androidReconnectFirstNoticeAfter
+	previousNoticeInterval := androidReconnectNoticeInterval
 	previousBaseDelay := androidReconnectBaseDelay
 	previousMaxDelay := androidReconnectMaxDelay
-	androidReconnectPromptAfter = promptAfter
+	androidReconnectFirstNoticeAfter = firstNoticeAfter
+	androidReconnectNoticeInterval = noticeInterval
 	androidReconnectBaseDelay = time.Millisecond
 	androidReconnectMaxDelay = time.Millisecond
 	t.Cleanup(func() {
-		androidReconnectPromptAfter = previousPromptAfter
+		androidReconnectFirstNoticeAfter = previousFirstNoticeAfter
+		androidReconnectNoticeInterval = previousNoticeInterval
 		androidReconnectBaseDelay = previousBaseDelay
 		androidReconnectMaxDelay = previousMaxDelay
 	})
 }
 
-func TestAndroidReconnectPromptsAgainOneIntervalAfterYes(t *testing.T) {
-	useFastAndroidReconnect(t, 20*time.Millisecond)
+func TestAndroidReconnectNotifiesAndRetriesForever(t *testing.T) {
+	useFastAndroidReconnect(t, 20*time.Millisecond, 30*time.Millisecond)
 	useFakeADB(t, fakeADBExecutor{output: func(args ...string) ([]byte, error) {
 		return []byte("device offline"), errors.New("exit status 1")
 	}})
 
 	previousNotifier := androidDisconnectNotifier
-	previousConfirmation := androidReconnectConfirmation
-	notifications := 0
-	confirmations := 0
-	androidDisconnectNotifier = func() { notifications++ }
-	androidReconnectConfirmation = func(string) bool {
-		confirmations++
-		return confirmations == 1
-	}
+	previousReminder := androidDisconnectReminder
+	firstNotifications := 0
+	reminders := 0
+	androidDisconnectNotifier = func() { firstNotifications++ }
+	androidDisconnectReminder = func() { reminders++ }
 	t.Cleanup(func() {
 		androidDisconnectNotifier = previousNotifier
-		androidReconnectConfirmation = previousConfirmation
+		androidDisconnectReminder = previousReminder
 	})
 
 	connection := newAndroidConnection("device:5555", "Pixel")
@@ -52,28 +52,27 @@ func TestAndroidReconnectPromptsAgainOneIntervalAfterYes(t *testing.T) {
 	if err := connection.Wait(context.Background(), cause); err != nil {
 		t.Fatal(err)
 	}
-	if notifications != 1 || confirmations != 1 {
-		t.Fatalf("first interval notifications=%d confirmations=%d", notifications, confirmations)
+	if firstNotifications != 1 || reminders != 0 {
+		t.Fatalf("first interval notifications=%d reminders=%d", firstNotifications, reminders)
 	}
 
 	if err := connection.Wait(context.Background(), cause); err != nil {
 		t.Fatal(err)
 	}
-	if notifications != 1 {
-		t.Fatalf("prompt repeated before another interval: %d", notifications)
+	if firstNotifications != 1 || reminders != 0 {
+		t.Fatalf("notification repeated early: first=%d reminders=%d", firstNotifications, reminders)
 	}
-	time.Sleep(25 * time.Millisecond)
-	err := connection.Wait(context.Background(), cause)
-	if err == nil || !strings.Contains(err.Error(), "再接続を中断") {
-		t.Fatalf("error=%v", err)
+	time.Sleep(35 * time.Millisecond)
+	if err := connection.Wait(context.Background(), cause); err != nil {
+		t.Fatal(err)
 	}
-	if notifications != 2 || confirmations != 2 {
-		t.Fatalf("second interval notifications=%d confirmations=%d", notifications, confirmations)
+	if firstNotifications != 1 || reminders != 1 {
+		t.Fatalf("repeat interval notifications=%d reminders=%d", firstNotifications, reminders)
 	}
 }
 
 func TestAndroidReconnectRediscoversSameDeviceWhenSerialChanges(t *testing.T) {
-	useFastAndroidReconnect(t, time.Hour)
+	useFastAndroidReconnect(t, time.Hour, time.Hour)
 	const oldSerial = "adb-old._adb-tls-connect._tcp"
 	const newSerial = "adb-new._adb-tls-connect._tcp"
 	useFakeADB(t, fakeADBExecutor{output: func(args ...string) ([]byte, error) {

@@ -52,6 +52,13 @@ func NotifyCompletion() {
 	_ = exec.Command("afplay", completionSound).Run()
 }
 
+func NotifyAndroidDisconnectReminder() {
+	// 2回目以降はmacOSの通知として鳴らす。通知音は集中モードと通知設定に従うため、
+	// 夜間はMac側で抑制できる。最初の1回だけはNotifyCompletionで無条件に知らせる。
+	const script = `display notification "Androidとの接続が切れたままです。自動再接続を続けています。" with title "Music Bridge" sound name "Glass"`
+	_ = exec.Command("osascript", "-e", script).Run()
+}
+
 func runSync(argv []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	initTarget := fs.Bool("init-target", false, "initialize target")

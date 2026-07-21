@@ -21,13 +21,16 @@ type androidConnection struct {
 	name           string
 	attempt        int
 	disconnectedAt time.Time
+	nextNoticeAt   time.Time
+	firstNotified  bool
 }
 
-var androidReconnectPromptAfter = time.Minute
+var androidReconnectFirstNoticeAfter = time.Minute
+var androidReconnectNoticeInterval = 5 * time.Minute
 var androidReconnectBaseDelay = time.Second
 var androidReconnectMaxDelay = 10 * time.Second
 var androidDisconnectNotifier = NotifyCompletion
-var androidReconnectConfirmation = confirmDefaultYes
+var androidDisconnectReminder = NotifyAndroidDisconnectReminder
 
 func newAndroidConnection(serial, name string) *androidConnection {
 	return &androidConnection{serial: serial, name: name}
@@ -53,36 +56,38 @@ func (connection *androidConnection) Wait(ctx context.Context, cause error) erro
 	connection.mu.Lock()
 	if connection.disconnectedAt.IsZero() {
 		connection.disconnectedAt = now
+		connection.nextNoticeAt = now.Add(androidReconnectFirstNoticeAfter)
 	}
-	promptAt := connection.disconnectedAt.Add(androidReconnectPromptAfter)
 	connection.attempt++
 	attempt := connection.attempt
-	shouldPrompt := now.Sub(connection.disconnectedAt) >= androidReconnectPromptAfter
+	firstNotice := !connection.firstNotified && !now.Before(connection.nextNoticeAt)
+	repeatedNotice := connection.firstNotified && !now.Before(connection.nextNoticeAt)
+	if firstNotice {
+		connection.firstNotified = true
+		connection.nextNoticeAt = now.Add(androidReconnectNoticeInterval)
+	} else if repeatedNotice {
+		connection.nextNoticeAt = now.Add(androidReconnectNoticeInterval)
+	}
+	nextNoticeAt := connection.nextNoticeAt
 	connection.mu.Unlock()
 
-	if shouldPrompt {
+	if firstNotice {
 		androidDisconnectNotifier()
 		fmt.Printf("\nAndroid(%s)との接続が1分以上切れています。\n", connection.name)
 		fmt.Println("Android側のWi-FiとWireless debuggingを確認し、必要なら端末を再起動・再接続してください。")
-		if !androidReconnectConfirmation("もう1分、再接続を待ちますか？ [Y/n] ") {
-			return fmt.Errorf("Androidとの再接続を中断しました: %w", cause)
-		}
-		connection.mu.Lock()
-		connection.disconnectedAt = time.Now()
-		connection.attempt = 0
-		attempt = 1
-		connection.mu.Unlock()
+		fmt.Println("接続が戻るまで自動再接続を続けます（Ctrl+Cで中止）。")
+	} else if repeatedNotice {
+		androidDisconnectReminder()
+		fmt.Printf("\nAndroid(%s)との接続が切れたままです。自動再接続を続けています。\n", connection.name)
 	}
 
 	delay := time.Duration(attempt) * androidReconnectBaseDelay
 	if delay > androidReconnectMaxDelay {
 		delay = androidReconnectMaxDelay
 	}
-	if !shouldPrompt {
-		remaining := time.Until(promptAt)
-		if remaining > 0 && delay > remaining {
-			delay = remaining
-		}
+	remaining := time.Until(nextNoticeAt)
+	if remaining > 0 && delay > remaining {
+		delay = remaining
 	}
 	fmt.Printf("\033[2K\rAndroidとの接続が切れました。再接続待機中... %s（Ctrl+Cで中止）", delay)
 	logf("Android reconnect wait %d: %v", attempt, cause)
@@ -95,6 +100,8 @@ func (connection *androidConnection) Wait(ctx context.Context, cause error) erro
 		connection.mu.Lock()
 		connection.attempt = 0
 		connection.disconnectedAt = time.Time{}
+		connection.nextNoticeAt = time.Time{}
+		connection.firstNotified = false
 		connection.mu.Unlock()
 		fmt.Print("\033[2K\rAndroidへ再接続しました。処理を再開します。\n")
 	}
